@@ -1,0 +1,2418 @@
+# ============================================================
+# SHADOW DUEL v2 - 3DS (Old 3DS / New 3DS)
+# Arquivo unico: o jogo inteiro (codigo, icone, banner) esta aqui dentro.
+#
+# Como usar:
+#   1. No GitHub, crie um repositorio novo.
+#   2. Salve este arquivo como  .github/workflows/build.yml
+#   3. Abra a aba Actions, escolha "Build Shadow Duel (3DS)" e clique em Run workflow
+#      (ou faca qualquer commit/push).
+#   4. Quando terminar, baixe o artefato "ShadowDuel-3DS":
+#        shadowduel.cia   -> instale com o FBI
+#        shadowduel.3dsx  -> coloque em sdmc:/3ds/ e abra pelo Homebrew Launcher
+#
+# Novidades da v2: musica e efeitos sonoros, save no cartao SD
+# (sdmc:/3ds/ShadowDuel/save.bin), moedas e gemas, loja (espadas, armaduras,
+# equipamentos, habilidades) e historia em 5 atos.
+# AUDIO: o 3DS so toca som se existir o arquivo sdmc:/3ds/dspfirm.cdc
+# (dump do firmware DSP, feito com o app DSP1). Sem ele o jogo roda mudo.
+# ============================================================
+name: Build Shadow Duel (3DS)
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkitarm:latest
+    steps:
+      - name: Install tools
+        run: |
+          export DEVKITPRO=${DEVKITPRO:-/opt/devkitpro}
+          export DEVKITARM=${DEVKITARM:-$DEVKITPRO/devkitARM}
+          export PATH=$PATH:$DEVKITPRO/tools/bin:$DEVKITARM/bin:/usr/local/bin
+          apt-get update
+          apt-get install -y wget unzip
+          if [ ! -f "$DEVKITPRO/libctru/include/citro2d.h" ]; then dkp-pacman -Syu --noconfirm 3ds-dev; fi
+          wget -q https://github.com/3DSGuy/Project_CTR/releases/download/makerom-v0.18/makerom-v0.18-ubuntu_x86_64.zip
+          unzip -o makerom-v0.18-ubuntu_x86_64.zip makerom -d /usr/local/bin
+          wget -q https://github.com/diasurgical/bannertool/releases/download/1.2.0/bannertool.zip
+          unzip -o -j bannertool.zip "linux-x86_64/bannertool" -d /usr/local/bin
+          chmod +x /usr/local/bin/makerom /usr/local/bin/bannertool
+
+      - name: Write project files
+        run: |
+          mkdir -p source build
+          cat > source/main.c <<'SDEOF'
+          #include <3ds.h>
+          #include <citro2d.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <math.h>
+          #include <time.h>
+          #include <sys/stat.h>
+
+          #ifndef SD_ROOT
+          #define SD_ROOT "sdmc:"
+          #endif
+
+          #define PI_F 3.14159265f
+          #define TAU_F 6.2831853f
+          #define GROUND 188.0f
+          #define ARENA_L 22.0f
+          #define ARENA_R 378.0f
+          #define PUNCH_TOTAL 16
+          #define PUNCH_A0 4
+          #define PUNCH_A1 8
+          #define KICK_TOTAL 25
+          #define KICK_A0 7
+          #define KICK_A1 13
+          #define SPEC_TOTAL 40
+          #define SPEC_FIRE 14
+          #define SR 22050
+          #define ABUF 2048
+          #define NOPP 7
+          #define NACT 5
+          #define NSW 6
+          #define NAR 6
+          #define NGE 6
+          #define NSP 4
+          #define NPASS 5
+          #define SAVE_MAGIC 0x53445532u
+          #define SAVE_VER 2
+
+          enum { ST_IDLE, ST_WALK, ST_JUMP, ST_PUNCH, ST_KICK, ST_SPECIAL, ST_BLOCK, ST_HURT, ST_KO, ST_WIN };
+          enum { SC_MENU, SC_PICK, SC_SET, SC_HOW, SC_FIGHT, SC_RESULT, SC_ACTS, SC_STORYTXT, SC_SHOP };
+          enum { M_STORY, M_SURVIVAL, M_FREE, M_TRAINING };
+          enum { FS_INTRO, FS_FIGHT, FS_KO };
+          enum { RA_NEXT, RA_NEXTACT, RA_ENDING, RA_RETRY, RA_AGAIN, RA_SHOP, RA_MENU };
+          enum { SFX_PUNCH, SFX_KICK, SFX_HIT, SFX_BLOCK, SFX_BOLT, SFX_KO, SFX_COIN, SFX_SEL, SFX_MOVE, SFX_ERR,
+                 SFX_WIN, SFX_LOSE, SFX_JUMP, SFX_HEAL, SFX_QUAKE, NSND };
+
+          typedef struct { int left, right, jump, punch, kick, block, special, dash; } Inp;
+
+          typedef struct {
+            float x, y, vx, vy, rot, energy, scale;
+            float dmgMul, defMul, reachAdd, spdMul, enMul, crit, regen, spPow, hpAcc;
+            int dir, hp, maxhp, st, t, hitDone, onGround, dashCd, dashT, dashDir, hurtT, comboN, comboT, acc;
+            int aiAct, aiActT, aiCool, aiBlockT, rushT, spKind, spCost;
+            int ar, ag, ab, bladeLen, blr, blg, blb, armorOn, amr, amg, amb;
+          } Fighter;
+
+          typedef struct { int active, owner; float x, y, vx; } Proj;
+          typedef struct { float x, y, vx, vy, r; int life, cr, cg, cb; } Part;
+          typedef struct { const char *name, *ten, *tpt; int hp; float aggr, block, scale; int acc, r, g, b; } Opp;
+          typedef struct { int opp, hp, aggr, coins, gems; } Fight;
+          typedef struct { const char *en, *pt; int coins, gems, dmg, reach, len, r, g, b; } SwordDef;
+          typedef struct { const char *en, *pt; int coins, gems, hp, def, r, g, b; } ArmorDef;
+          typedef struct { const char *en, *pt; int coins, gems, kind, val; } GearDef;
+          typedef struct { const char *en, *pt, *den, *dpt; int coins, gems, cost; } SpecDef;
+          typedef struct { const char *en, *pt, *den, *dpt; int base; } PassDef;
+          typedef struct { s16 *d; int n; } Snd;
+
+          typedef struct {
+            u32 magic;
+            int version;
+            int coins, gems, actsUnlocked, curAct, curFight, clearedMask;
+            int swordOwn, armorOwn, gearOwn, specOwn;
+            int swordEq, armorEq, gearEq, specEq;
+            int passLv[NPASS];
+            int wins, losses, bestSurv, bestCombo;
+            int diff, rounds, timeIdx, shake, box, lang, music, sfx;
+            int chk;
+          } Save;
+
+          static const Opp OPP[NOPP] = {
+            {"Wisp", "Shadow apprentice", "Aprendiz das sombras", 80, 0.30f, 0.05f, 0.92f, 16, 90, 200, 255},
+            {"Ronin", "Wandering blade", "Lâmina errante", 92, 0.38f, 0.08f, 1.00f, 5, 255, 170, 60},
+            {"Monk", "Silent guardian", "Guardião silencioso", 100, 0.34f, 0.20f, 1.00f, 16, 120, 255, 150},
+            {"Reaper", "Soul collector", "Coletor de almas", 105, 0.46f, 0.12f, 1.04f, 2, 190, 100, 255},
+            {"Warlord", "Iron tyrant", "Tirano de ferro", 125, 0.50f, 0.16f, 1.12f, 6, 255, 100, 60},
+            {"Phantom", "Faster than light", "Mais rápido que a luz", 110, 0.62f, 0.22f, 1.00f, 17, 240, 240, 255},
+            {"Shadow Lord", "The final duel", "O duelo final", 150, 0.70f, 0.26f, 1.15f, 10, 255, 50, 80}
+          };
+
+          static const Fight FIGHTS[NACT][3] = {
+            {{0, 90, 0, 40, 0}, {1, 95, 0, 50, 0}, {2, 105, 0, 80, 1}},
+            {{3, 95, 4, 60, 0}, {1, 115, 6, 70, 0}, {4, 100, 0, 110, 2}},
+            {{2, 120, 6, 80, 0}, {5, 95, 4, 90, 0}, {4, 125, 6, 140, 2}},
+            {{5, 115, 6, 100, 0}, {3, 130, 6, 110, 0}, {5, 135, 8, 170, 3}},
+            {{4, 140, 8, 130, 0}, {5, 140, 10, 150, 0}, {6, 100, 0, 300, 5}}
+          };
+
+          static const char *ACT_EN[NACT] = {"Rebirth of the Hero", "Echoes of the Fallen", "The Iron Road", "Night of Phantoms", "The Shadow Throne"};
+          static const char *ACT_PT[NACT] = {"Renascimento do Herói", "Ecos dos Caídos", "A Estrada de Ferro", "Noite dos Fantasmas", "O Trono das Sombras"};
+          static const char *ACT_TXT_EN[NACT][3] = {
+            {"The hero wakes in the ashes of a burned shrine.", "His memory is gone. Only a faint shadow answers.", "Defeat the wanderers to remember who you were."},
+            {"Whispers rise from the old battlefield.", "Every fallen warrior wants to test your blade.", "Prove your strength before the dusk."},
+            {"A road paved with armor and broken swords.", "The warlords guard the pass to the mountain.", "Break their line and keep moving."},
+            {"The moon vanishes and the shadows grow fast.", "Phantoms strike from every direction.", "Stay calm, block and counter."},
+            {"At the summit waits the one who stole your past.", "The Shadow Lord rules with an iron will.", "End this duel and take back your name."}
+          };
+          static const char *ACT_TXT_PT[NACT][3] = {
+            {"O herói desperta nas cinzas de um santuário queimado.", "Sua memória sumiu. Só uma sombra fraca responde.", "Derrote os errantes para lembrar quem você foi."},
+            {"Sussurros sobem do velho campo de batalha.", "Cada guerreiro caído quer testar sua lâmina.", "Prove sua força antes do anoitecer."},
+            {"Uma estrada de armaduras e espadas quebradas.", "Os senhores da guerra guardam a passagem.", "Quebre a linha deles e siga em frente."},
+            {"A lua desaparece e as sombras crescem rápido.", "Fantasmas atacam de todos os lados.", "Mantenha a calma, bloqueie e contra-ataque."},
+            {"No topo espera quem roubou o seu passado.", "O Senhor das Sombras governa com vontade de ferro.", "Termine este duelo e recupere seu nome."}
+          };
+          static const char *END_EN[3] = {"The Shadow Lord falls and the memories return.", "The hero remembers his name and his purpose.", "The shadows are quiet. For now."};
+          static const char *END_PT[3] = {"O Senhor das Sombras cai e as memórias voltam.", "O herói lembra do seu nome e do seu propósito.", "As sombras estão quietas. Por enquanto."};
+
+          static const SwordDef SWORDS[NSW] = {
+            {"Bare hands", "Mãos nuas", 0, 0, 0, 0, 0, 0, 0, 0},
+            {"Iron blade", "Lâmina de ferro", 150, 0, 8, 4, 26, 190, 195, 210},
+            {"Steel katana", "Katana de aço", 400, 0, 16, 7, 32, 210, 230, 255},
+            {"Crimson fang", "Presa carmesim", 900, 0, 25, 9, 34, 255, 80, 90},
+            {"Moonlit saber", "Sabre lunar", 0, 12, 35, 11, 36, 150, 200, 255},
+            {"Void reaper", "Ceifador do vazio", 0, 28, 50, 14, 40, 190, 90, 255}
+          };
+          static const ArmorDef ARMORS[NAR] = {
+            {"Cloth rags", "Trapos", 0, 0, 0, 0, 0, 0, 0},
+            {"Leather vest", "Colete de couro", 120, 0, 15, 5, 140, 95, 60},
+            {"Chainmail", "Cota de malha", 320, 0, 30, 10, 170, 175, 190},
+            {"Shadow plate", "Placa sombria", 750, 0, 45, 16, 110, 70, 170},
+            {"Dragon scale", "Escama de dragão", 0, 14, 65, 22, 60, 190, 120},
+            {"Eclipse armor", "Armadura do eclipse", 0, 30, 90, 30, 255, 190, 60}
+          };
+          static const GearDef GEARS[NGE] = {
+            {"None", "Nenhum", 0, 0, 0, 0},
+            {"Swift boots", "Botas velozes", 160, 0, 1, 12},
+            {"Spirit charm", "Amuleto espiritual", 220, 0, 2, 25},
+            {"Lucky coin", "Moeda da sorte", 260, 0, 3, 30},
+            {"War gloves", "Luvas de guerra", 380, 0, 4, 12},
+            {"Phoenix feather", "Pena de fênix", 0, 10, 5, 2}
+          };
+          static const SpecDef SPECS[NSP] = {
+            {"Shadow bolt", "Raio sombrio", "Fires a bolt of shadow.", "Dispara um raio de sombra.", 0, 0, 50},
+            {"Quake", "Terremoto", "Shockwave hits grounded foes.", "Onda de choque no chão.", 260, 0, 60},
+            {"Shadow rush", "Investida sombria", "Dash through the enemy.", "Atravessa o inimigo.", 420, 0, 40},
+            {"Soul mend", "Cura da alma", "Heals you for 22 HP.", "Cura 22 de vida.", 0, 8, 60}
+          };
+          static const PassDef PASS[NPASS] = {
+            {"Vitality", "Vitalidade", "+6 max HP per level", "+6 de vida máx. por nível", 80},
+            {"Fury", "Fúria", "+4% damage per level", "+4% de dano por nível", 100},
+            {"Focus", "Foco", "+8% energy gain per level", "+8% de energia por nível", 90},
+            {"Resilience", "Resistência", "-4% damage taken per level", "-4% de dano recebido", 110},
+            {"Mastery", "Maestria", "+10% special power per level", "+10% de poder especial", 120}
+          };
+
+          static Save sv;
+          static C2D_TextBuf gBuf;
+          static float zc = 0, OX = 0, OY = 0;
+          static Fighter F[2];
+          static Proj projs[4];
+          static Part parts[120];
+          static int scene = SC_MENU, mode = M_STORY, curOpp = 0, fs = FS_INTRO, fst = 0, roundNo = 1;
+          static int wins[2], needWins = 2, timerF = 0, survWins = 0, carryHp = 0, paused = 0, koWinner = -1;
+          static int menuSel = 0, pickSel = 0, setSel = 0, setTop = 0, resSel = 0, pauseSel = 0, howPage = 0, actsSel = 0;
+          static int shopTab = 0, shopSel = 0, shopTop = 0, eraseArm = 0;
+          static int shakeT = 0, hitStop = 0, maxCombo = 0, running = 1, matchWon = 0, gframe = 0;
+          static int bufP = 0, bufK = 0, bufS = 0, bufJ = 0, bufD = 0;
+          static int resN = 2, resAct[3];
+          static const char *resLabels[3];
+          static int storyAct = 0, storyFight = 0, curHpPct = 100, curAggrAdd = 0, txtAct = 0, txtKind = 0;
+          static int rewCoins = 0, rewGems = 0, actDone = 0, toastT = 0, audioOk = 0, firstFight = 0;
+          static char toastBuf[64];
+          static float shakeA = 0;
+          static const int timeVals[3] = {30, 60, 99};
+
+          #define setDiff (sv.diff)
+          #define setRounds (sv.rounds)
+          #define setTimeIdx (sv.timeIdx)
+          #define setShake (sv.shake)
+          #define setBox (sv.box)
+
+          static const char *tr(const char *en, const char *pt) { return sv.lang ? pt : en; }
+          static float nz(void) { zc += 0.00004f; return zc; }
+          static u32 C(int r, int g, int b, int a) { return C2D_Color32(r, g, b, a); }
+          static float frand(void) { return (rand() & 0x7fff) / 32767.0f; }
+          static float clampf(float v, float a, float b) { return v < a ? a : (v > b ? b : v); }
+          static int clampi(int v, int a, int b) { return v < a ? a : (v > b ? b : v); }
+
+          static void rect(float x, float y, float w, float h, u32 c) { C2D_DrawRectSolid(x + OX, y + OY, nz(), w, h, c); }
+          static void circ(float x, float y, float r, u32 c) { C2D_DrawCircleSolid(x + OX, y + OY, nz(), r, c); }
+          static void line(float x0, float y0, float x1, float y1, float th, u32 c) {
+            C2D_DrawLine(x0 + OX, y0 + OY, c, x1 + OX, y1 + OY, c, th, nz());
+          }
+          static void tri(float x0, float y0, float x1, float y1, float x2, float y2, u32 c) {
+            C2D_DrawTriangle(x0 + OX, y0 + OY, c, x1 + OX, y1 + OY, c, x2 + OX, y2 + OY, c, nz());
+          }
+          static void text(float x, float y, float sc, u32 col, const char *s) {
+            C2D_Text t;
+            C2D_TextParse(&t, gBuf, s);
+            C2D_TextOptimize(&t);
+            C2D_DrawText(&t, C2D_WithColor, x + OX, y + OY, nz(), sc, sc, col);
+          }
+          static float textw(const char *s, float sc) {
+            C2D_Text t;
+            float w = 0, h = 0;
+            C2D_TextParse(&t, gBuf, s);
+            C2D_TextGetDimensions(&t, sc, sc, &w, &h);
+            return w;
+          }
+          static void textc(float cx, float y, float sc, u32 col, const char *s) {
+            text(cx - textw(s, sc) * 0.5f, y, sc, col, s);
+          }
+          static void texts(float cx, float y, float sc, u32 col, const char *s) {
+            textc(cx + 1.5f, y + 1.5f, sc, C(0, 0, 0, 200), s);
+            textc(cx, y, sc, col, s);
+          }
+          static void coin_icon(float x, float y, float r) {
+            circ(x, y, r, C(255, 200, 60, 255));
+            circ(x, y, r * 0.62f, C(200, 140, 20, 255));
+            circ(x, y, r * 0.38f, C(255, 225, 120, 255));
+          }
+          static void gem_icon(float x, float y, float r) {
+            tri(x - r, y - r * 0.2f, x + r, y - r * 0.2f, x, y - r, C(150, 240, 255, 255));
+            tri(x - r, y - r * 0.2f, x + r, y - r * 0.2f, x, y + r, C(60, 170, 235, 255));
+            tri(x - r * 0.4f, y - r * 0.2f, x + r * 0.4f, y - r * 0.2f, x, y + r * 0.7f, C(200, 250, 255, 255));
+          }
+
+          /* ---------------------------------------------------------------- audio */
+          static const int SC_HIRA[5] = {0, 2, 3, 7, 8};
+          static const int SC_MINP[5] = {0, 3, 5, 7, 10};
+          static const int SC_INSEN[5] = {0, 1, 5, 7, 10};
+          static const int SC_PHRY[7] = {0, 1, 3, 5, 7, 8, 10};
+          static const int *SC_TAB[4] = {SC_HIRA, SC_MINP, SC_INSEN, SC_PHRY};
+          static const int SC_NUM[4] = {5, 5, 5, 7};
+          static const float T_BPM[7] = {84, 108, 116, 124, 132, 142, 78};
+          static const int T_ROOT[7] = {50, 45, 47, 43, 48, 41, 53};
+          static const int T_SCALE[7] = {0, 1, 0, 2, 3, 3, 1};
+
+          static int mTrack = -1, mInten = 0, mStep = 0, mNs = 5, mRoot = 45, mDrums = 0, mArp = 0, mProg[4];
+          static const int *mScale = SC_HIRA;
+          static float mSub = 0, mBpm = 100;
+          static int bassP[64], leadP[64];
+          static float bPh, lPh, aPh, kPh, bF = 110, lF = 440, aF = 440, bE, lE, aE, kE, kF, sE, hE, lp1, hpPrev;
+          static unsigned nsd = 12345u, gsd = 1u;
+          static ndspWaveBuf mwb[3], swb[4];
+          static s16 *mbuf[3];
+          static Snd snd[NSND];
+
+          static float nrand(void) { nsd = nsd * 1664525u + 1013904223u; return ((nsd >> 8) & 0xffff) / 32768.0f - 1.0f; }
+          static unsigned lcg(unsigned *s) { *s = *s * 1664525u + 1013904223u; return *s >> 16; }
+          static float mfreq(int m) { return 440.0f * powf(2.0f, (m - 69) / 12.0f); }
+          static int dmidi(int base, int deg) { return base + mScale[deg % mNs] + 12 * (deg / mNs); }
+          static s16 f2s(float v) { if (v > 1.0f) v = 1.0f; if (v < -1.0f) v = -1.0f; return (s16)(v * 30000.0f); }
+
+          static void gen_track(int t, int inten) {
+            unsigned s = 1234u + (unsigned)t * 977u;
+            int sc = T_SCALE[t], b, st, i, calm = (t == 0 || t == 6);
+            int A[16], B[16], d;
+            mScale = SC_TAB[sc]; mNs = SC_NUM[sc]; mRoot = T_ROOT[t]; mBpm = T_BPM[t] + (inten ? 10.0f : 0.0f);
+            mProg[0] = 0; mProg[1] = 1 + (int)(lcg(&s) % (unsigned)(mNs - 1)); mProg[2] = (int)(lcg(&s) % (unsigned)mNs);
+            mProg[3] = 1 + (int)(lcg(&s) % (unsigned)(mNs - 1));
+            d = mNs + (int)(lcg(&s) % (unsigned)mNs);
+            for (i = 0; i < 16; i++) {
+              int delta[5] = {-2, -1, 0, 1, 2};
+              if (i != 0 && (int)(lcg(&s) % 100u) < (calm ? 55 : 35)) { A[i] = -1; continue; }
+              d = clampi(d + delta[lcg(&s) % 5u], mNs - 1, mNs * 2 + 1);
+              A[i] = d;
+            }
+            for (i = 0; i < 16; i++) {
+              int delta[5] = {-2, -1, 0, 1, 2};
+              if (i != 0 && (int)(lcg(&s) % 100u) < (calm ? 55 : 35)) { B[i] = -1; continue; }
+              d = clampi(d + delta[lcg(&s) % 5u], mNs - 1, mNs * 2 + 1);
+              B[i] = d;
+            }
+            for (b = 0; b < 4; b++) {
+              for (st = 0; st < 16; st++) {
+                int hit = calm ? (st == 0 || st == 8) : (st == 0 || st == 3 || st == 6 || st == 8 || st == 11 || st == 14);
+                bassP[b * 16 + st] = hit ? mProg[b] : -1;
+                leadP[b * 16 + st] = (b == 2) ? B[st] : ((b == 3 && st >= 12) ? B[st] : A[st]);
+              }
+            }
+            mDrums = !calm; mArp = (t >= 2 && t != 6) || inten;
+          }
+
+          static void music_play(int t, int inten) {
+            if (t == mTrack && inten == mInten) return;
+            mTrack = t; mInten = inten;
+            mStep = 63; mSub = 0; bE = lE = aE = kE = sE = hE = 0; bPh = lPh = aPh = kPh = 0; lp1 = 0;
+            if (t >= 0) gen_track(t, inten);
+          }
+
+          static void music_fill(s16 *out, int n) {
+            int i;
+            float stepLen;
+            if (mTrack < 0 || !sv.music) { memset(out, 0, (size_t)n * 2); return; }
+            stepLen = SR * 60.0f / mBpm / 4.0f;
+            for (i = 0; i < n; i++) {
+              float bs, ls, as = 0, ks = 0, rn, m;
+              if (mSub <= 0.0f) {
+                int st;
+                mStep = (mStep + 1) & 63; mSub += stepLen; st = mStep & 15;
+                if (bassP[mStep] >= 0) { bF = mfreq(dmidi(mRoot - 12, bassP[mStep])); bE = 1.0f; }
+                if (leadP[mStep] >= 0) { lF = mfreq(dmidi(mRoot + 12, leadP[mStep])); lE = 1.0f; }
+                if (mArp) {
+                  static const int ao[4] = {0, 2, 4, 2};
+                  aF = mfreq(dmidi(mRoot + 24, mProg[mStep >> 4] + ao[st & 3])); aE = 1.0f;
+                }
+                if (mDrums) {
+                  if (st == 0 || st == 8 || (mBpm > 120.0f && (st == 6 || st == 14))) kE = 1.0f;
+                  if (st == 4 || st == 12) sE = 1.0f;
+                  if ((st & 1) == 0 || mInten) hE = 1.0f;
+                }
+              }
+              mSub -= 1.0f;
+              bs = (4.0f * fabsf(bPh - 0.5f) - 1.0f) * bE * 0.30f;
+              ls = (lPh < 0.32f) ? 1.0f : -1.0f;
+              lp1 += 0.28f * (ls - lp1);
+              ls = lp1 * lE * 0.16f;
+              if (mArp && aE > 0.003f) as = sinf(TAU_F * aPh) * aE * 0.07f;
+              if (kE > 0.003f) { kF = 42.0f + 110.0f * kE * kE; ks = sinf(TAU_F * kPh) * kE * 0.55f; kPh += kF / SR; if (kPh >= 1.0f) kPh -= 1.0f; }
+              rn = nrand();
+              m = (bs + ls + as + ks + rn * sE * 0.20f + (rn - hpPrev) * hE * 0.10f) * 0.8f;
+              hpPrev = rn;
+              out[i] = f2s(m);
+              bPh += bF / SR; if (bPh >= 1.0f) bPh -= 1.0f;
+              lPh += lF / SR; if (lPh >= 1.0f) lPh -= 1.0f;
+              aPh += aF / SR; if (aPh >= 1.0f) aPh -= 1.0f;
+              bE *= 0.99975f; lE *= 0.99985f; aE *= 0.9996f; kE *= 0.9994f; sE *= 0.9993f; hE *= 0.9985f;
+            }
+          }
+
+          static s16 *alloc_snd(int id, int n) {
+            snd[id].d = (s16 *)linearAlloc((size_t)n * 2);
+            snd[id].n = snd[id].d ? n : 0;
+            return snd[id].d;
+          }
+
+          #define GEN(id, dur, expr) { int n_ = (int)(SR * (dur)); s16 *d_ = alloc_snd(id, n_); int i_; if (d_) for (i_ = 0; i_ < n_; i_++) { float t = (float)i_ / SR; d_[i_] = f2s(expr); } }
+
+          static float jingle(float t, const float *nf, float len) {
+            int k = (int)(t / len);
+            float lt;
+            if (k > 3) k = 3;
+            lt = t - k * len;
+            return 0.35f * sinf(TAU_F * nf[k] * t) * expf(-lt * 3.0f) * (t < 1.0f ? 1.0f : 0.0f);
+          }
+
+          static void gen_all(void) {
+            static const float wn[4] = {392.0f, 494.0f, 587.0f, 784.0f};
+            static const float ln[4] = {392.0f, 349.0f, 330.0f, 262.0f};
+            static const float hn[4] = {523.0f, 659.0f, 784.0f, 1047.0f};
+            GEN(SFX_PUNCH, 0.12, 0.6f * nrand() * expf(-t * 35.0f) + 0.6f * sinf(TAU_F * 130.0f * t) * expf(-t * 28.0f));
+            GEN(SFX_KICK, 0.16, 0.5f * nrand() * expf(-t * 22.0f) + 0.8f * sinf(TAU_F * (60.0f + 40.0f * expf(-t * 20.0f)) * t) * expf(-t * 16.0f));
+            GEN(SFX_HIT, 0.18, 0.8f * nrand() * expf(-t * 18.0f) + 0.7f * sinf(TAU_F * (80.0f + 120.0f * expf(-t * 25.0f)) * t) * expf(-t * 12.0f));
+            GEN(SFX_BLOCK, 0.15, 0.45f * (sinf(TAU_F * 900.0f * t) + 0.6f * sinf(TAU_F * 1350.0f * t)) * expf(-t * 24.0f));
+            GEN(SFX_BOLT, 0.35, 0.5f * sinf(TAU_F * (300.0f + 600.0f * t / 0.35f) * t) * (1.0f - t / 0.35f) * (0.7f + 0.3f * sinf(TAU_F * 30.0f * t)));
+            GEN(SFX_KO, 0.7, 0.7f * sinf(TAU_F * (220.0f - 170.0f * t / 0.7f) * t) * (1.0f - t / 0.7f) + 0.5f * nrand() * expf(-t * 14.0f));
+            GEN(SFX_COIN, 0.25, 0.3f * ((sinf(TAU_F * (t < 0.08f ? 988.0f : 1319.0f) * t) > 0.0f) ? 1.0f : -1.0f) * expf(-(t < 0.08f ? t : t - 0.08f) * 10.0f));
+            GEN(SFX_SEL, 0.1, 0.4f * sinf(TAU_F * (660.0f + 220.0f * t / 0.1f) * t) * (1.0f - t / 0.1f));
+            GEN(SFX_MOVE, 0.04, 0.3f * sinf(TAU_F * 440.0f * t) * (1.0f - t / 0.04f));
+            GEN(SFX_ERR, 0.2, 0.3f * ((sinf(TAU_F * 110.0f * t) > 0.0f) ? 1.0f : -1.0f) * (1.0f - t / 0.2f));
+            GEN(SFX_WIN, 1.0, jingle(t, wn, 0.2f));
+            GEN(SFX_LOSE, 1.0, jingle(t, ln, 0.25f));
+            GEN(SFX_JUMP, 0.12, 0.35f * sinf(TAU_F * (300.0f + 300.0f * t / 0.12f) * t) * (1.0f - t / 0.12f));
+            GEN(SFX_HEAL, 0.5, jingle(t * 2.0f, hn, 0.18f) * 1.1f);
+            GEN(SFX_QUAKE, 0.5, 0.9f * sinf(TAU_F * 50.0f * t) * expf(-t * 7.0f) + 0.6f * nrand() * expf(-t * 9.0f));
+          }
+
+          static void sfx(int id) {
+            int c;
+            if (!audioOk || !sv.sfx || !snd[id].d) return;
+            for (c = 0; c < 4; c++) {
+              if (swb[c].status == NDSP_WBUF_DONE || swb[c].status == NDSP_WBUF_FREE) {
+                swb[c].data_pcm16 = snd[id].d; swb[c].nsamples = (u32)snd[id].n; swb[c].looping = false;
+                ndspChnWaveBufAdd(1 + c, &swb[c]);
+                return;
+              }
+            }
+          }
+
+          static void audio_init(void) {
+            int i;
+            float mix[12];
+            audioOk = 0;
+            if (R_FAILED(ndspInit())) return;
+            ndspSetOutputMode(NDSP_OUTPUT_STEREO);
+            memset(mix, 0, sizeof mix); mix[0] = 0.8f; mix[1] = 0.8f;
+            for (i = 0; i < 5; i++) {
+              ndspChnReset(i);
+              ndspChnSetInterp(i, NDSP_INTERP_LINEAR);
+              ndspChnSetRate(i, (float)SR);
+              ndspChnSetFormat(i, NDSP_FORMAT_MONO_PCM16);
+              ndspChnSetMix(i, mix);
+            }
+            gen_all();
+            memset(mwb, 0, sizeof mwb); memset(swb, 0, sizeof swb);
+            for (i = 0; i < 3; i++) {
+              mbuf[i] = (s16 *)linearAlloc(ABUF * 2);
+              if (!mbuf[i]) return;
+              music_fill(mbuf[i], ABUF);
+              DSP_FlushDataCache(mbuf[i], ABUF * 2);
+              mwb[i].data_pcm16 = mbuf[i]; mwb[i].nsamples = ABUF; mwb[i].looping = false;
+              ndspChnWaveBufAdd(0, &mwb[i]);
+            }
+            for (i = 0; i < NSND; i++) if (snd[i].d) DSP_FlushDataCache(snd[i].d, (u32)snd[i].n * 2);
+            audioOk = 1;
+          }
+
+          static void audio_update(void) {
+            int i;
+            if (!audioOk) return;
+            for (i = 0; i < 3; i++) {
+              if (mwb[i].status == NDSP_WBUF_DONE) {
+                music_fill(mbuf[i], ABUF);
+                DSP_FlushDataCache(mbuf[i], ABUF * 2);
+                ndspChnWaveBufAdd(0, &mwb[i]);
+              }
+            }
+          }
+
+          /* ----------------------------------------------------------------- save */
+          static int sv_chk(const Save *s) {
+            const unsigned char *p = (const unsigned char *)s;
+            unsigned h = 2166136261u;
+            size_t i, n = sizeof(Save) - sizeof(int);
+            for (i = 0; i < n; i++) h = (h ^ p[i]) * 16777619u;
+            return (int)h;
+          }
+
+          static void sv_defaults(void) {
+            int lang = sv.lang;
+            memset(&sv, 0, sizeof sv);
+            sv.magic = SAVE_MAGIC; sv.version = SAVE_VER;
+            sv.actsUnlocked = 1; sv.swordOwn = 1; sv.armorOwn = 1; sv.gearOwn = 1; sv.specOwn = 1;
+            sv.diff = 1; sv.rounds = 2; sv.timeIdx = 1; sv.shake = 1; sv.music = 1; sv.sfx = 1; sv.lang = lang;
+          }
+
+          static int save_game(void) {
+            FILE *f;
+            size_t w;
+            mkdir(SD_ROOT "/3ds", 0777);
+            mkdir(SD_ROOT "/3ds/ShadowDuel", 0777);
+            sv.magic = SAVE_MAGIC; sv.version = SAVE_VER; sv.chk = sv_chk(&sv);
+            f = fopen(SD_ROOT "/3ds/ShadowDuel/save.bin", "wb");
+            if (!f) return 0;
+            w = fwrite(&sv, sizeof sv, 1, f);
+            fclose(f);
+            return w == 1;
+          }
+
+          static int load_game(void) {
+            FILE *f = fopen(SD_ROOT "/3ds/ShadowDuel/save.bin", "rb");
+            Save t;
+            size_t r;
+            int i;
+            if (!f) return 0;
+            r = fread(&t, sizeof t, 1, f);
+            fclose(f);
+            if (r != 1 || t.magic != SAVE_MAGIC || t.version != SAVE_VER || t.chk != sv_chk(&t)) return 0;
+            sv = t;
+            sv.coins = clampi(sv.coins, 0, 999999); sv.gems = clampi(sv.gems, 0, 99999);
+            sv.actsUnlocked = clampi(sv.actsUnlocked, 1, NACT); sv.curAct = clampi(sv.curAct, 0, NACT - 1);
+            sv.curFight = clampi(sv.curFight, 0, 3);
+            sv.swordOwn |= 1; sv.armorOwn |= 1; sv.gearOwn |= 1; sv.specOwn |= 1;
+            sv.swordEq = clampi(sv.swordEq, 0, NSW - 1); sv.armorEq = clampi(sv.armorEq, 0, NAR - 1);
+            sv.gearEq = clampi(sv.gearEq, 0, NGE - 1); sv.specEq = clampi(sv.specEq, 0, NSP - 1);
+            if (!((sv.swordOwn >> sv.swordEq) & 1)) sv.swordEq = 0;
+            if (!((sv.armorOwn >> sv.armorEq) & 1)) sv.armorEq = 0;
+            if (!((sv.gearOwn >> sv.gearEq) & 1)) sv.gearEq = 0;
+            if (!((sv.specOwn >> sv.specEq) & 1)) sv.specEq = 0;
+            for (i = 0; i < NPASS; i++) sv.passLv[i] = clampi(sv.passLv[i], 0, 5);
+            sv.diff = clampi(sv.diff, 0, 2); sv.rounds = clampi(sv.rounds, 1, 3); sv.timeIdx = clampi(sv.timeIdx, 0, 2);
+            sv.shake = !!sv.shake; sv.box = !!sv.box; sv.lang = !!sv.lang; sv.music = !!sv.music; sv.sfx = !!sv.sfx;
+            return 1;
+          }
+
+          static void toast(const char *s) { snprintf(toastBuf, sizeof toastBuf, "%s", s); toastT = 150; }
+
+          /* ---------------------------------------------------------- fight logic */
+          static void set_st(Fighter *f, int s) { f->st = s; f->t = 0; f->hitDone = 0; f->dashT = 0; }
+
+          static void init_fighter(Fighter *f, float x, int dir, int maxhp) {
+            memset(f, 0, sizeof(Fighter));
+            f->x = x; f->y = GROUND; f->dir = dir; f->maxhp = maxhp; f->hp = maxhp;
+            f->onGround = 1; f->scale = 1.0f;
+            f->dmgMul = 1.0f; f->defMul = 1.0f; f->spdMul = 1.0f; f->enMul = 1.0f; f->spPow = 1.0f; f->spCost = 50;
+          }
+
+          static void apply_loadout_ex(Fighter *f, int sw, int ar, int ge, int sp) {
+            const SwordDef *s = &SWORDS[sw];
+            const ArmorDef *a = &ARMORS[ar];
+            const GearDef *g = &GEARS[ge];
+            float defm;
+            f->maxhp = 100 + a->hp + sv.passLv[0] * 6; f->hp = f->maxhp;
+            f->dmgMul = 1.0f + s->dmg / 100.0f + sv.passLv[1] * 0.04f;
+            f->reachAdd = (float)s->reach;
+            defm = (1.0f - a->def / 100.0f) * (1.0f - sv.passLv[3] * 0.04f);
+            f->defMul = defm < 0.4f ? 0.4f : defm;
+            f->enMul = 1.0f + sv.passLv[2] * 0.08f + (g->kind == 2 ? g->val / 100.0f : 0.0f);
+            f->spdMul = 1.0f + (g->kind == 1 ? g->val / 100.0f : 0.0f);
+            f->crit = (g->kind == 4) ? g->val / 100.0f : 0.0f;
+            f->regen = (g->kind == 5) ? g->val * 0.01f : 0.0f;
+            f->spPow = 1.0f + sv.passLv[4] * 0.10f;
+            f->spKind = sp; f->spCost = SPECS[sp].cost - sv.passLv[4] * 3;
+            if (f->spCost < 30) f->spCost = 30;
+            f->bladeLen = s->len; f->blr = s->r; f->blg = s->g; f->blb = s->b;
+            f->armorOn = ar > 0; f->amr = a->r; f->amg = a->g; f->amb = a->b;
+          }
+          static void apply_loadout(Fighter *f) { apply_loadout_ex(f, sv.swordEq, sv.armorEq, sv.gearEq, sv.specEq); }
+
+          static void style_player(Fighter *f) { f->ar = 70; f->ag = 210; f->ab = 255; f->acc = 16; f->scale = 1.0f; apply_loadout(f); }
+          static void style_opp(Fighter *f, int i) {
+            f->ar = OPP[i].r; f->ag = OPP[i].g; f->ab = OPP[i].b; f->acc = OPP[i].acc; f->scale = OPP[i].scale;
+            f->bladeLen = (OPP[i].acc & 4) ? 28 : 0; f->blr = 205; f->blg = 210; f->blb = 225;
+          }
+
+          static void spawn(float x, float y, int n, int r, int g, int b, float sp) {
+            int k, i;
+            for (k = 0; k < n; k++) {
+              for (i = 0; i < 120; i++) {
+                if (parts[i].life <= 0) {
+                  float a = frand() * 2.0f * PI_F, s = sp * (0.35f + frand() * 0.65f);
+                  parts[i].x = x; parts[i].y = y; parts[i].vx = cosf(a) * s; parts[i].vy = sinf(a) * s - 1.0f;
+                  parts[i].life = 16 + rand() % 14; parts[i].r = 1.5f + frand() * 2.5f;
+                  parts[i].cr = r; parts[i].cg = g; parts[i].cb = b;
+                  break;
+                }
+              }
+            }
+          }
+          static void update_parts(void) {
+            int i;
+            for (i = 0; i < 120; i++) {
+              if (parts[i].life > 0) {
+                parts[i].x += parts[i].vx; parts[i].y += parts[i].vy; parts[i].vy += 0.15f; parts[i].life--;
+              }
+            }
+          }
+
+          static int atk_params(const Fighter *f, float *reach, float *y0, float *y1, int *a0, int *a1, int *dmg, float *kb, int *stun) {
+            if (f->st == ST_PUNCH) {
+              *reach = 40.0f + f->reachAdd; *y0 = 38; *y1 = 66; *a0 = PUNCH_A0; *a1 = PUNCH_A1; *dmg = 5; *kb = 3.0f; *stun = 11; return 1;
+            }
+            if (f->st == ST_KICK) {
+              *reach = 54; *y0 = 4; *y1 = 46; *a0 = KICK_A0; *a1 = KICK_A1; *dmg = 9; *kb = 5.0f; *stun = 19; return 1;
+            }
+            return 0;
+          }
+
+          static int overlap(const Fighter *a, const Fighter *d, float reach, float y0, float y1) {
+            float s = a->scale;
+            float ax0 = a->x + a->dir * 6.0f, ax1 = a->x + a->dir * reach * s;
+            float lo = fminf(ax0, ax1), hi = fmaxf(ax0, ax1);
+            float dx0 = d->x - 11.0f * d->scale, dx1 = d->x + 11.0f * d->scale;
+            float ay0 = a->y - y1 * s, ay1 = a->y - y0 * s;
+            float dy0 = d->y - 72.0f * d->scale, dy1 = d->y;
+            if (hi < dx0 || lo > dx1) return 0;
+            if (ay1 < dy0 || ay0 > dy1) return 0;
+            return 1;
+          }
+
+          static void do_hit(Fighter *a, Fighter *d, int dir, int dmg, float kb, int stun, int spec) {
+            int blocked = (d->st == ST_BLOCK && d->dir == -dir);
+            int crit = (!spec && a->crit > 0.0f && frand() < a->crit);
+            float sx = d->x - dir * 6.0f, sy = d->y - (spec ? 44.0f : 48.0f) * d->scale;
+            float dm = dmg * a->dmgMul * (spec ? a->spPow : 1.0f) * (crit ? 1.6f : 1.0f) * d->defMul;
+            dmg = (int)(dm + 0.5f);
+            if (dmg < 1) dmg = 1;
+            if (blocked) {
+              int bd = spec ? dmg / 3 : dmg / 5;
+              if (bd < 1) bd = 1;
+              d->hp -= bd; d->vx = dir * kb * 0.6f;
+              d->energy += 2.0f; a->energy += 1.0f;
+              spawn(sx, sy, 6, 140, 190, 255, 3.0f);
+              hitStop = 2;
+              sfx(SFX_BLOCK);
+            } else {
+              d->hp -= dmg;
+              set_st(d, ST_HURT);
+              d->hurtT = stun; d->vx = dir * kb;
+              if (!d->onGround) d->vy = -3.5f;
+              a->energy += dmg * 1.4f * a->enMul; d->energy += dmg * 0.7f * d->enMul;
+              a->comboN++; a->comboT = 100;
+              if (a->comboN > maxCombo && a == &F[0]) maxCombo = a->comboN;
+              if (crit) spawn(sx, sy, 16, 255, 120, 60, 5.0f);
+              else spawn(sx, sy, spec ? 22 : 12, 255, 230, 120, spec ? 6.0f : 4.0f);
+              hitStop = spec ? 7 : 4;
+              shakeT = spec ? 14 : 8; shakeA = spec ? 5.0f : 3.0f;
+              sfx(SFX_HIT);
+            }
+            if (a->energy > 100.0f) a->energy = 100.0f;
+            if (d->energy > 100.0f) d->energy = 100.0f;
+            if (d->hp <= 0) {
+              if (mode == M_TRAINING && d == &F[1]) {
+                d->hp = d->maxhp;
+                spawn(d->x, d->y - 40, 26, 255, 255, 255, 5.0f);
+              } else {
+                d->hp = 0;
+                set_st(d, ST_KO);
+                d->vy = -5.5f; d->onGround = 0; d->vx = dir * 5.0f;
+                hitStop = 10; shakeT = 22; shakeA = 6.0f;
+                sfx(SFX_KO);
+              }
+            }
+          }
+
+          static int try_hit(Fighter *a, Fighter *d) {
+            float reach, y0, y1, kb;
+            int a0, a1, dmg, stun;
+            if (fs != FS_FIGHT || a->hitDone || d->st == ST_KO) return 0;
+            if (!atk_params(a, &reach, &y0, &y1, &a0, &a1, &dmg, &kb, &stun)) return 0;
+            if (a->t < a0 || a->t > a1) return 0;
+            if (!overlap(a, d, reach, y0, y1)) return 0;
+            a->hitDone = 1;
+            do_hit(a, d, a->dir, dmg, kb, stun, 0);
+            return 1;
+          }
+
+          static void fire(Fighter *f) {
+            int i, owner = (f == &F[0]) ? 0 : 1;
+            for (i = 0; i < 4; i++) {
+              if (!projs[i].active) {
+                projs[i].active = 1; projs[i].owner = owner;
+                projs[i].x = f->x + f->dir * 26.0f * f->scale; projs[i].y = f->y - 46.0f * f->scale;
+                projs[i].vx = f->dir * 5.8f;
+                spawn(projs[i].x, projs[i].y, 8, f->ar, f->ag, f->ab, 3.0f);
+                sfx(SFX_BOLT);
+                return;
+              }
+            }
+          }
+
+          static void do_special(Fighter *f, Fighter *o) {
+            int k = f->spKind;
+            if (fs != FS_FIGHT) return;
+            if (k == 0) fire(f);
+            else if (k == 1) {
+              sfx(SFX_QUAKE); shakeT = 16; shakeA = 4.0f;
+              spawn(f->x, f->y - 4.0f, 20, 255, 210, 100, 5.0f);
+              if (o->st != ST_KO && o->onGround && fabsf(o->x - f->x) < 115.0f)
+                do_hit(f, o, (o->x >= f->x) ? 1 : -1, 18, 8.0f, 24, 1);
+            } else if (k == 2) { f->rushT = 10; sfx(SFX_BOLT); }
+            else {
+              f->hp += (int)(22.0f * f->spPow);
+              if (f->hp > f->maxhp) f->hp = f->maxhp;
+              spawn(f->x, f->y - 40.0f, 20, 90, 255, 140, 3.0f);
+              sfx(SFX_HEAL);
+            }
+            f->energy -= (float)f->spCost;
+            if (f->energy < 0) f->energy = 0;
+          }
+
+          static void update_projs(void) {
+            int i;
+            for (i = 0; i < 4; i++) {
+              Proj *p = &projs[i];
+              Fighter *t;
+              if (!p->active) continue;
+              p->x += p->vx;
+              if (p->x < -30 || p->x > 430) { p->active = 0; continue; }
+              spawn(p->x, p->y, 1, F[p->owner].ar, F[p->owner].ag, F[p->owner].ab, 1.0f);
+              t = &F[1 - p->owner];
+              if (t->st != ST_KO && fabsf(p->x - t->x) < 16.0f * t->scale && p->y > t->y - 72.0f * t->scale && p->y < t->y) {
+                p->active = 0;
+                do_hit(&F[p->owner], t, p->vx > 0 ? 1 : -1, 16, 7.0f, 24, 1);
+              }
+            }
+          }
+
+          static void update_fighter(Fighter *f, Fighter *o, Inp in, int canAct) {
+            int mv;
+            f->t++;
+            if (f->dashCd > 0) f->dashCd--;
+            if (f->comboT > 0) { f->comboT--; if (f->comboT == 0) f->comboN = 0; }
+            if (f->regen > 0.0f && f->st != ST_KO && f->hp > 0 && fs == FS_FIGHT) {
+              f->hpAcc += f->regen;
+              if (f->hpAcc >= 1.0f) { f->hpAcc -= 1.0f; if (f->hp < f->maxhp) f->hp++; }
+            }
+            if (f->onGround && (f->st == ST_IDLE || f->st == ST_WALK || f->st == ST_BLOCK || f->st == ST_WIN))
+              f->dir = (o->x >= f->x) ? 1 : -1;
+            if (canAct && (f->st == ST_IDLE || f->st == ST_WALK || f->st == ST_JUMP || f->st == ST_BLOCK)) {
+              if (f->onGround && in.block) {
+                if (f->st != ST_BLOCK) set_st(f, ST_BLOCK);
+                f->vx = 0;
+              } else {
+                if (f->st == ST_BLOCK) set_st(f, ST_IDLE);
+                if (in.special && f->energy >= (float)f->spCost) { set_st(f, ST_SPECIAL); f->vx = 0; }
+                else if (in.punch) { set_st(f, ST_PUNCH); sfx(SFX_PUNCH); }
+                else if (in.kick) { set_st(f, ST_KICK); sfx(SFX_KICK); }
+                else if (f->onGround) {
+                  mv = in.right - in.left;
+                  if (in.jump) {
+                    f->vy = -9.8f; f->onGround = 0; set_st(f, ST_JUMP); f->vx = mv * 2.6f * f->spdMul; sfx(SFX_JUMP);
+                  } else {
+                    if (in.dash && f->dashCd == 0) { f->dashT = 8; f->dashCd = 45; f->dashDir = mv != 0 ? mv : f->dir; }
+                    if (f->dashT > 0) { f->dashT--; f->vx = f->dashDir * 7.0f * f->spdMul; }
+                    else if (mv != 0) { f->vx = mv * 2.3f * f->spdMul; if (f->st != ST_WALK) set_st(f, ST_WALK); }
+                    else if (f->st == ST_WALK) set_st(f, ST_IDLE);
+                  }
+                }
+              }
+            }
+            if (f->st == ST_PUNCH) {
+              try_hit(f, o);
+              if (f->t >= PUNCH_TOTAL) set_st(f, f->onGround ? ST_IDLE : ST_JUMP);
+            } else if (f->st == ST_KICK) {
+              try_hit(f, o);
+              if (f->t >= KICK_TOTAL) set_st(f, f->onGround ? ST_IDLE : ST_JUMP);
+            } else if (f->st == ST_SPECIAL) {
+              if (f->t == SPEC_FIRE) do_special(f, o);
+              if (f->t >= SPEC_TOTAL) set_st(f, ST_IDLE);
+            } else if (f->st == ST_HURT) {
+              if (f->t >= f->hurtT) set_st(f, f->onGround ? ST_IDLE : ST_JUMP);
+            }
+            if (f->rushT > 0) {
+              f->rushT--; f->vx = f->dir * 11.0f;
+              if (!f->hitDone && fs == FS_FIGHT && o->st != ST_KO && fabsf(o->x - f->x) < 28.0f * o->scale + 6.0f && fabsf(o->y - f->y) < 50.0f) {
+                f->hitDone = 1;
+                do_hit(f, o, f->dir, 13, 7.0f, 22, 1);
+              }
+            }
+            f->x += f->vx;
+            if (!f->onGround) {
+              f->vy += 0.55f; f->y += f->vy;
+              if (f->y >= GROUND) {
+                f->y = GROUND; f->vy = 0; f->onGround = 1;
+                if (f->st == ST_JUMP) set_st(f, ST_IDLE);
+              }
+            }
+            if (f->onGround && f->st != ST_WALK && f->dashT == 0 && f->rushT == 0) f->vx *= 0.82f;
+            if (f->st == ST_KO) f->rot = fminf(PI_F * 0.5f, f->t * 0.10f); else f->rot = 0;
+            f->x = clampf(f->x, ARENA_L, ARENA_R);
+          }
+
+          static void separate(void) {
+            float dx = F[1].x - F[0].x, m = 20.0f, p, sg;
+            if (fabsf(dx) < m && F[0].onGround && F[1].onGround && F[0].st != ST_KO && F[1].st != ST_KO) {
+              p = (m - fabsf(dx)) * 0.5f; sg = dx >= 0 ? 1.0f : -1.0f;
+              F[0].x = clampf(F[0].x - sg * p, ARENA_L, ARENA_R);
+              F[1].x = clampf(F[1].x + sg * p, ARENA_L, ARENA_R);
+            }
+          }
+
+          static Inp ai_think(Fighter *f, Fighter *o) {
+            Inp in;
+            const Opp *op = &OPP[curOpp];
+            float dm = setDiff == 0 ? 0.55f : (setDiff == 2 ? 1.35f : 1.0f);
+            float aggr = op->aggr + curAggrAdd / 100.0f;
+            float d = fabsf(o->x - f->x), r;
+            int toward = (o->x > f->x) ? 1 : -1, bolt = 0, threat, i;
+            memset(&in, 0, sizeof in);
+            if (mode == M_TRAINING || f->st == ST_KO || f->st == ST_HURT || f->st == ST_WIN) return in;
+            if (f->aiCool > 0) f->aiCool--;
+            if (f->aiBlockT > 0) { f->aiBlockT--; in.block = 1; return in; }
+            for (i = 0; i < 4; i++)
+              if (projs[i].active && projs[i].owner == 0 && fabsf(projs[i].x - f->x) < 80.0f) bolt = 1;
+            threat = (o->st == ST_PUNCH || o->st == ST_KICK) && d < (70.0f + o->reachAdd) * f->scale;
+            if ((threat || bolt) && f->onGround && frand() < op->block * dm * 0.9f) {
+              f->aiBlockT = 12 + rand() % 14; in.block = 1; return in;
+            }
+            if (f->t < 4 && f->st == ST_IDLE && d < 46.0f * f->scale && f->aiCool == 0 && frand() < aggr * dm) {
+              f->aiAct = frand() < 0.4f ? 4 : 3; f->aiActT = 2; f->aiCool = 20 + rand() % 20;
+            } else if (f->aiActT > 0) f->aiActT--;
+            else {
+              r = frand();
+              f->aiAct = 0; f->aiActT = 8 + rand() % 14;
+              if (f->energy >= (float)f->spCost && d > 70.0f && frand() < 0.30f * dm) { f->aiAct = 5; f->aiActT = 2; }
+              else if (d > 64.0f) {
+                f->aiAct = (r < 0.35f + aggr) ? 1 : 0;
+                if (frand() < 0.06f * dm) f->aiAct = 6;
+              } else if (d > 34.0f) {
+                if (f->aiCool == 0 && r < aggr * dm) {
+                  f->aiAct = (frand() < 0.55f) ? 4 : 3; f->aiActT = 2;
+                  f->aiCool = (int)((55.0f - 30.0f * aggr) / dm) + rand() % 20;
+                } else f->aiAct = (r < 0.5f) ? 1 : ((r < 0.75f) ? 2 : 0);
+              } else {
+                if (f->aiCool == 0 && r < aggr * dm * 1.2f) {
+                  f->aiAct = 3; f->aiActT = 2;
+                  f->aiCool = (int)((45.0f - 25.0f * aggr) / dm) + rand() % 15;
+                } else f->aiAct = (r < 0.6f) ? 2 : 0;
+              }
+            }
+            switch (f->aiAct) {
+              case 1: if (toward > 0) in.right = 1; else in.left = 1; break;
+              case 2: if (toward > 0) in.left = 1; else in.right = 1; break;
+              case 3: in.punch = 1; break;
+              case 4: in.kick = 1; break;
+              case 5: in.special = 1; break;
+              case 6: in.jump = 1; if (toward > 0) in.right = 1; else in.left = 1; break;
+              default: break;
+            }
+            return in;
+          }
+
+          static int fight_track(void) {
+            if (mode == M_STORY) return 1 + storyAct;
+            if (mode == M_SURVIVAL) return 1 + (survWins % 5);
+            if (mode == M_FREE) return 1 + (curOpp % 5);
+            return 1;
+          }
+          static int fight_inten(void) {
+            if (mode == M_STORY) return storyFight == 2;
+            if (mode == M_FREE) return curOpp == NOPP - 1;
+            if (mode == M_SURVIVAL) return survWins >= 7;
+            return 0;
+          }
+
+          static void start_round(void) {
+            const Opp *op = &OPP[curOpp];
+            float mul = setDiff == 0 ? 0.85f : (setDiff == 2 ? 1.2f : 1.0f);
+            int ehp = (int)(op->hp * mul * curHpPct / 100.0f) + (mode == M_SURVIVAL ? (survWins / NOPP) * 25 : 0);
+            init_fighter(&F[0], 130.0f, 1, 100);
+            init_fighter(&F[1], 270.0f, -1, ehp);
+            style_player(&F[0]);
+            style_opp(&F[1], curOpp);
+            F[1].dmgMul = 1.0f + (mode == M_STORY ? storyAct * 0.06f : (mode == M_SURVIVAL ? survWins * 0.03f : 0.0f));
+            if (mode == M_SURVIVAL && carryHp > 0) F[0].hp = clampi(carryHp, 1, F[0].maxhp);
+            timerF = (mode == M_TRAINING) ? 0 : timeVals[setTimeIdx] * 60;
+            fs = FS_INTRO; fst = 0; hitStop = 0; shakeT = 0;
+            memset(projs, 0, sizeof projs);
+            memset(parts, 0, sizeof parts);
+            music_play(fight_track(), fight_inten());
+          }
+
+          static void start_match_ex(int m, int opp, int hpPct, int aggrAdd) {
+            mode = m; curOpp = opp; wins[0] = wins[1] = 0; roundNo = 1; maxCombo = 0;
+            curHpPct = hpPct; curAggrAdd = aggrAdd; rewCoins = rewGems = 0; actDone = 0; firstFight = 0;
+            needWins = (m == M_SURVIVAL) ? 1 : (m == M_TRAINING ? 99 : setRounds);
+            if (m == M_SURVIVAL) { survWins = 0; carryHp = 0; }
+            scene = SC_FIGHT; paused = 0; pauseSel = 0;
+            bufP = bufK = bufS = bufJ = bufD = 0;
+            start_round();
+          }
+          static void start_match(int m, int opp) { start_match_ex(m, opp, 100, 0); }
+
+          static void start_story_fight(int a, int f) {
+            const Fight *fg = &FIGHTS[a][f];
+            storyAct = a; storyFight = f;
+            start_match_ex(M_STORY, fg->opp, fg->hp, fg->aggr);
+          }
+
+          static void demo_init(void) {
+            init_fighter(&F[0], 150.0f, 1, 100);
+            init_fighter(&F[1], 250.0f, -1, 100);
+            style_player(&F[0]);
+            style_opp(&F[1], rand() % NOPP);
+            memset(projs, 0, sizeof projs);
+            memset(parts, 0, sizeof parts);
+            shakeT = 0;
+          }
+          static void menu_enter(void) {
+            if (scene == SC_SET || scene == SC_SHOP || scene == SC_RESULT || scene == SC_FIGHT) save_game();
+            scene = SC_MENU; eraseArm = 0;
+            demo_init();
+            music_play(0, 0);
+          }
+          static void open_storytxt(int a) {
+            txtAct = a; txtKind = 0; scene = SC_STORYTXT;
+            demo_init();
+            music_play(0, 0);
+          }
+          static void shop_enter(void) {
+            demo_init();
+            scene = SC_SHOP; shopTab = 0; shopSel = 0; shopTop = 0;
+            F[1].x = 380.0f;
+            music_play(6, 0);
+          }
+
+          static void res_add(int a, const char *l) { resAct[resN] = a; resLabels[resN] = l; resN++; }
+
+          static void show_result(void) {
+            scene = SC_RESULT; resSel = 0; resN = 0;
+            music_play(-1, 0);
+            if (mode == M_STORY) {
+              if (matchWon) {
+                if (storyFight < 2) res_add(RA_NEXT, tr("Next fight", "Próxima luta"));
+                else if (storyAct < NACT - 1) res_add(RA_NEXTACT, tr("Next act", "Próximo ato"));
+                else res_add(RA_ENDING, tr("Ending", "Final"));
+              } else res_add(RA_RETRY, tr("Retry", "Tentar de novo"));
+              res_add(RA_SHOP, tr("Shop", "Loja"));
+              res_add(RA_MENU, tr("Main menu", "Menu principal"));
+            } else if (mode == M_SURVIVAL) {
+              res_add(RA_AGAIN, tr("Play again", "Jogar de novo"));
+              res_add(RA_SHOP, tr("Shop", "Loja"));
+              res_add(RA_MENU, tr("Main menu", "Menu principal"));
+            } else {
+              res_add(RA_AGAIN, tr("Rematch", "Revanche"));
+              res_add(RA_MENU, tr("Main menu", "Menu principal"));
+            }
+            sfx(matchWon ? SFX_WIN : SFX_LOSE);
+            if (rewCoins > 0 || rewGems > 0) sfx(SFX_COIN);
+            save_game();
+          }
+
+          static void give(int coins, int gems) {
+            const GearDef *g = &GEARS[sv.gearEq];
+            if (g->kind == 3) coins = coins * (100 + g->val) / 100;
+            sv.coins = clampi(sv.coins + coins, 0, 999999);
+            sv.gems = clampi(sv.gems + gems, 0, 99999);
+            rewCoins = coins; rewGems = gems;
+          }
+
+          static void finish_match(void) {
+            matchWon = wins[0] > wins[1];
+            if (matchWon) sv.wins++; else sv.losses++;
+            if (maxCombo > sv.bestCombo) sv.bestCombo = maxCombo;
+            if (mode == M_SURVIVAL && matchWon) {
+              survWins++;
+              carryHp = F[0].hp + 35;
+              if (carryHp > F[0].maxhp) carryHp = F[0].maxhp;
+              curOpp = survWins % NOPP;
+              wins[0] = wins[1] = 0; roundNo = 1;
+              start_round();
+              return;
+            }
+            if (mode == M_STORY && matchWon) {
+              int idx = storyAct * 3 + storyFight;
+              const Fight *fg = &FIGHTS[storyAct][storyFight];
+              int first = !((sv.clearedMask >> idx) & 1);
+              give(first ? fg->coins : fg->coins / 2, first ? fg->gems : 0);
+              firstFight = first;
+              sv.clearedMask |= 1 << idx;
+              if (storyAct == sv.curAct && storyFight == sv.curFight) {
+                if (storyFight < 2) sv.curFight = storyFight + 1;
+                else if (storyAct < NACT - 1) {
+                  sv.curAct = storyAct + 1; sv.curFight = 0;
+                  if (sv.actsUnlocked < storyAct + 2) sv.actsUnlocked = storyAct + 2;
+                } else sv.curFight = 3;
+              }
+              actDone = (storyFight == 2);
+            } else if (mode == M_SURVIVAL) {
+              if (survWins > sv.bestSurv) sv.bestSurv = survWins;
+              give(survWins * 30, survWins / 5);
+            } else if (mode == M_FREE && matchWon) {
+              give(20 + curOpp * 5, 0);
+            }
+            show_result();
+          }
+
+          static void end_round(int winner) {
+            if (winner >= 0) wins[winner]++;
+            koWinner = winner;
+            fs = FS_KO; fst = 0;
+            memset(projs, 0, sizeof projs);
+          }
+
+          static void update_fight(u32 kD, u32 kH, circlePosition cp) {
+            Inp pi, ai, none;
+            memset(&none, 0, sizeof none);
+            fst++;
+            if (shakeT > 0) shakeT--;
+            update_parts();
+            if (fs == FS_INTRO) {
+              update_fighter(&F[0], &F[1], none, 0);
+              update_fighter(&F[1], &F[0], none, 0);
+              if (fst >= 130) { fs = FS_FIGHT; fst = 0; }
+              return;
+            }
+            if (fs == FS_KO) {
+              update_fighter(&F[0], &F[1], none, 0);
+              update_fighter(&F[1], &F[0], none, 0);
+              if (fst == 40) {
+                if (F[0].hp > 0 && F[0].onGround && F[0].st != ST_KO) set_st(&F[0], ST_WIN);
+                if (F[1].hp > 0 && F[1].onGround && F[1].st != ST_KO) set_st(&F[1], ST_WIN);
+              }
+              if (fst >= 170) {
+                if (wins[0] >= needWins || wins[1] >= needWins) finish_match();
+                else { roundNo++; start_round(); }
+              }
+              return;
+            }
+            if (hitStop > 0) { hitStop--; return; }
+            if (kD & KEY_A) bufP = 7;
+            if (kD & KEY_B) bufK = 7;
+            if (kD & KEY_R) bufS = 7;
+            if (kD & (KEY_X | KEY_DUP)) bufJ = 7;
+            if (kD & KEY_L) bufD = 4;
+            memset(&pi, 0, sizeof pi);
+            if ((kH & KEY_DLEFT) || cp.dx < -45) pi.left = 1;
+            if ((kH & KEY_DRIGHT) || cp.dx > 45) pi.right = 1;
+            pi.block = (kH & KEY_Y) != 0;
+            pi.punch = bufP > 0; pi.kick = bufK > 0; pi.special = bufS > 0; pi.jump = bufJ > 0; pi.dash = bufD > 0;
+            ai = ai_think(&F[1], &F[0]);
+            if (mode == M_TRAINING) F[0].energy = 100.0f;
+            update_fighter(&F[0], &F[1], pi, 1);
+            update_fighter(&F[1], &F[0], ai, 1);
+            if (F[0].st == ST_PUNCH) bufP = 0;
+            if (F[0].st == ST_KICK) bufK = 0;
+            if (F[0].st == ST_SPECIAL) bufS = 0;
+            if (F[0].st == ST_JUMP) bufJ = 0;
+            if (bufP > 0) bufP--;
+            if (bufK > 0) bufK--;
+            if (bufS > 0) bufS--;
+            if (bufJ > 0) bufJ--;
+            if (bufD > 0) bufD--;
+            separate();
+            update_projs();
+            if (timerF > 0) {
+              timerF--;
+              if (timerF == 0) {
+                float p = (float)F[0].hp / F[0].maxhp, e = (float)F[1].hp / F[1].maxhp;
+                end_round(p > e ? 0 : (e > p ? 1 : -1));
+                return;
+              }
+            }
+            if (F[0].hp <= 0 || F[1].hp <= 0) {
+              if (F[0].hp <= 0 && F[1].hp <= 0) end_round(-1);
+              else end_round(F[0].hp <= 0 ? 1 : 0);
+            }
+          }
+
+          /* -------------------------------------------------------------- drawing */
+          static float prof(float p) {
+            if (p < 0.3f) return p / 0.3f;
+            if (p < 0.55f) return 1.0f;
+            p = 1.0f - (p - 0.55f) / 0.45f;
+            return p < 0 ? 0 : p;
+          }
+
+          static void T(const Fighter *f, float lx, float ly, float *sx, float *sy) {
+            float c = cosf(f->rot), s = sinf(f->rot);
+            float x = lx * c - ly * s, y = lx * s + ly * c;
+            *sx = f->x + f->dir * x * f->scale;
+            *sy = f->y - y * f->scale - (f->rot > 0.1f ? 4.0f : 0.0f);
+          }
+
+          static void lbend(float *L, int a, int b, int m, float bend) {
+            float ax = L[a * 2], ay = L[a * 2 + 1], bx = L[b * 2], by = L[b * 2 + 1];
+            float dx = bx - ax, dy = by - ay, len = sqrtf(dx * dx + dy * dy) + 0.001f;
+            L[m * 2] = (ax + bx) * 0.5f - dy / len * bend;
+            L[m * 2 + 1] = (ay + by) * 0.5f + dx / len * bend;
+          }
+
+          static void pose_local(const Fighter *f, float *L) {
+            float bob = sinf(f->t * 0.12f), ph = f->t * 0.30f, e, c, s1;
+            float hx = 0, hy = 71, nx = 0, ny = 60, px = 0, py = 34;
+            float h1x = 16, h1y = 52, h2x = 7, h2y = 48;
+            float f1x = 10, f1y = 0, f2x = -10, f2y = 0;
+            switch (f->st) {
+              case ST_IDLE: ny += bob * 0.8f; hy += bob * 0.8f; h1y += bob; h2y += bob; break;
+              case ST_WALK:
+                s1 = sinf(ph);
+                f1x = s1 * 14; f2x = -s1 * 14; f1y = fmaxf(0, cosf(ph)) * 7; f2y = fmaxf(0, -cosf(ph)) * 7;
+                h1x = 14 - s1 * 6; h2x = 6 + s1 * 6; break;
+              case ST_JUMP: f1x = 12; f1y = 16; f2x = -6; f2y = 10; h1x = 14; h1y = 58; h2x = 4; h2y = 56; break;
+              case ST_PUNCH:
+                e = prof((float)f->t / PUNCH_TOTAL);
+                h1x = 16 + e * 32; h1y = 54; h2x = 6; h2y = 48; nx = e * 5; hx = e * 6; f1x = 14; f2x = -12; break;
+              case ST_KICK:
+                e = prof((float)f->t / KICK_TOTAL);
+                f1x = 10 + e * 44; f1y = 8 + e * 24; f2x = -8; nx = -e * 7; hx = -e * 9;
+                h1x = 6; h1y = 56; h2x = -6; h2y = 60; break;
+              case ST_SPECIAL:
+                if (f->t < SPEC_FIRE) {
+                  c = (float)f->t / SPEC_FIRE; h1x = 10 - c * 10; h1y = 50; h2x = 6 - c * 10; h2y = 46; nx = -c * 3;
+                } else {
+                  c = fminf(1.0f, (f->t - SPEC_FIRE) / 6.0f); h1x = 14 + c * 18; h1y = 52; h2x = 10 + c * 20; h2y = 48; nx = c * 4;
+                }
+                f1x = 14; f2x = -12; break;
+              case ST_BLOCK:
+                py = 28; ny = 54; hy = 65; nx = 2; hx = 3; h1x = 17; h1y = 60; h2x = 14; h2y = 48; f1x = 14; f2x = -12; break;
+              case ST_HURT:
+                nx = -8; hx = -11; ny = 59; hy = 69; h1x = -10; h1y = 54; h2x = -16; h2y = 44; f1x = 6; f2x = -14; break;
+              case ST_KO: h1x = 14; h1y = 48; h2x = -12; h2y = 40; f1x = 16; f2x = -14; break;
+              case ST_WIN:
+                ny += bob; hy += bob; h1x = 8; h1y = 88 + bob * 2; h2x = -6; h2y = 86 - bob * 2; break;
+              default: break;
+            }
+            L[0] = hx; L[1] = hy; L[2] = nx; L[3] = ny; L[4] = px; L[5] = py;
+            L[8] = h1x; L[9] = h1y; L[12] = h2x; L[13] = h2y;
+            L[16] = f1x; L[17] = f1y; L[20] = f2x; L[21] = f2y;
+            lbend(L, 1, 4, 3, -6.0f); lbend(L, 1, 6, 5, -6.0f);
+            lbend(L, 2, 8, 7, 5.0f); lbend(L, 2, 10, 9, 5.0f);
+          }
+
+          static void draw_fighter(const Fighter *f) {
+            float L[22], S[22], s = f->scale, w, ex, ey, ax, ay, bx, by, cx, cy;
+            int i, pass;
+            u32 body = C(14, 12, 22, 255), glow = C(f->ar, f->ag, f->ab, 110), eye = C(f->ar, f->ag, f->ab, 255);
+            pose_local(f, L);
+            for (i = 0; i < 11; i++) T(f, L[i * 2], L[i * 2 + 1], &S[i * 2], &S[i * 2 + 1]);
+            w = 46.0f * s * (1.0f - (GROUND - f->y) / 260.0f);
+            C2D_DrawEllipseSolid(f->x - w * 0.5f + OX, GROUND - 4.0f + OY, nz(), w, 8.0f, C(0, 0, 0, 110));
+            for (pass = 0; pass < 2; pass++) {
+              u32 c = pass ? body : glow;
+              float a = pass ? 0.0f : 4.0f, tk = 5.0f * s + a, tt = 7.0f * s + a;
+              line(S[2], S[3], S[4], S[5], tt, c);
+              line(S[2], S[3], S[6], S[7], tk, c); line(S[6], S[7], S[8], S[9], tk, c);
+              line(S[2], S[3], S[10], S[11], tk, c); line(S[10], S[11], S[12], S[13], tk, c);
+              line(S[4], S[5], S[14], S[15], tk, c); line(S[14], S[15], S[16], S[17], tk, c);
+              line(S[4], S[5], S[18], S[19], tk, c); line(S[18], S[19], S[20], S[21], tk, c);
+              for (i = 1; i < 11; i++) circ(S[i * 2], S[i * 2 + 1], tk * 0.5f, c);
+              circ(S[0], S[1], 9.0f * s + (pass ? 0.0f : 2.0f), c);
+            }
+            if (f->armorOn) {
+              u32 ac = C(f->amr, f->amg, f->amb, 255);
+              line(S[2], S[3] + 2.0f * s, S[4], S[5] - 2.0f * s, 5.0f * s, ac);
+              circ(S[2], S[3] + 1.0f * s, 5.5f * s, ac);
+              line(S[4] - 5.0f * s, S[5], S[4] + 5.0f * s, S[5], 3.0f * s, ac);
+            }
+            if (f->st != ST_KO) {
+              T(f, L[0] + 4.5f, L[1] + 1.5f, &ex, &ey);
+              circ(ex, ey, 2.3f * s, eye);
+            }
+            if (f->acc & 1) {
+              T(f, L[0] - 13, L[1] + 5, &ax, &ay); T(f, L[0] + 13, L[1] + 5, &bx, &by); T(f, L[0], L[1] + 23, &cx, &cy);
+              tri(ax, ay, bx, by, cx, cy, body);
+              line(ax - 2, ay, bx + 2, by, 3.0f * s, body);
+            }
+            if (f->acc & 2) {
+              T(f, L[0] - 7, L[1] + 6, &ax, &ay); T(f, L[0] - 12, L[1] + 21, &bx, &by); T(f, L[0] - 2, L[1] + 8, &cx, &cy);
+              tri(ax, ay, bx, by, cx, cy, eye);
+              T(f, L[0] + 7, L[1] + 6, &ax, &ay); T(f, L[0] + 12, L[1] + 21, &bx, &by); T(f, L[0] + 2, L[1] + 8, &cx, &cy);
+              tri(ax, ay, bx, by, cx, cy, eye);
+            }
+            if (f->acc & 8) {
+              for (i = -1; i <= 1; i++) {
+                T(f, L[0] + i * 6 - 3, L[1] + 8, &ax, &ay); T(f, L[0] + i * 6 + 3, L[1] + 8, &bx, &by); T(f, L[0] + i * 6, L[1] + 18, &cx, &cy);
+                tri(ax, ay, bx, by, cx, cy, C(255, 200, 60, 255));
+              }
+            }
+            if (f->acc & 16) {
+              float wv = f->t * 0.3f;
+              T(f, L[0] - 7, L[1] - 2, &ax, &ay);
+              T(f, L[0] - 16, L[1] - 4 + sinf(wv) * 3, &bx, &by);
+              T(f, L[0] - 25, L[1] - 8 + sinf(wv + 1.0f) * 4, &cx, &cy);
+              line(ax, ay, bx, by, 3.0f * s, eye); line(bx, by, cx, cy, 3.0f * s, eye);
+            }
+            if (f->bladeLen > 0) {
+              float bl = (float)f->bladeLen;
+              T(f, L[8], L[9], &ax, &ay);
+              if (f->st == ST_PUNCH) T(f, L[8] + bl + 4.0f, L[9] + 3, &bx, &by); else T(f, L[8] + 7, L[9] + bl, &bx, &by);
+              line(ax, ay, bx, by, 4.0f * s, C(f->blr, f->blg, f->blb, 110));
+              line(ax, ay, bx, by, 2.5f * s, C(f->blr, f->blg, f->blb, 255));
+            }
+            if (f->st == ST_SPECIAL && f->t < SPEC_FIRE) {
+              static const int aur[4][3] = {{-1, 0, 0}, {255, 210, 100}, {-1, 0, 0}, {90, 255, 140}};
+              int ar = aur[f->spKind][0] < 0 ? f->ar : aur[f->spKind][0];
+              int ag = aur[f->spKind][0] < 0 ? f->ag : aur[f->spKind][1];
+              int ab = aur[f->spKind][0] < 0 ? f->ab : aur[f->spKind][2];
+              T(f, L[8], L[9], &ax, &ay);
+              circ(ax, ay, 5.0f + f->t * 0.9f, C(ar, ag, ab, 90));
+              circ(ax, ay, 3.0f + f->t * 0.3f, C(255, 255, 255, 220));
+            }
+          }
+
+          static void draw_bg(void) {
+            int i;
+            for (i = 0; i < 16; i++) {
+              float k = powf(i / 15.0f, 1.3f);
+              rect(0, i * 12.0f, 400, 12.6f, C(28 + (int)(212 * k), 8 + (int)(112 * k), 44 + (int)(26 * k), 255));
+            }
+            circ(285, 150, 56, C(255, 210, 140, 60));
+            circ(285, 150, 42, C(255, 224, 170, 255));
+            tri(-30, 190, 70, 96, 170, 190, C(86, 30, 56, 255));
+            tri(120, 190, 215, 118, 320, 190, C(76, 26, 52, 255));
+            tri(270, 190, 360, 104, 440, 190, C(86, 30, 56, 255));
+            tri(-40, 190, 40, 134, 130, 190, C(40, 14, 34, 255));
+            tri(200, 190, 300, 140, 400, 190, C(36, 12, 32, 255));
+            rect(0, GROUND, 400, 52, C(12, 8, 16, 255));
+            rect(0, GROUND, 400, 2, C(130, 44, 64, 255));
+            for (i = 0; i < 4; i++) {
+              float bxp = (i < 2) ? 8.0f + i * 22.0f : 372.0f + (i - 2) * 22.0f - 20.0f;
+              line(bxp, 0, bxp + 3, GROUND + 40, 6.0f, C(10, 22, 18, 255));
+              rect(bxp - 3, 40.0f + i * 31.0f, 9, 3, C(24, 46, 36, 255));
+              rect(bxp - 3, 110.0f + i * 17.0f, 9, 3, C(24, 46, 36, 255));
+            }
+          }
+
+          static void draw_world(void) {
+            int i;
+            if (shakeT > 0 && setShake) { OX = (frand() - 0.5f) * 2.0f * shakeA; OY = (frand() - 0.5f) * 2.0f * shakeA; }
+            else { OX = 0; OY = 0; }
+            draw_bg();
+            draw_fighter(&F[0]);
+            if (scene != SC_SHOP) draw_fighter(&F[1]);
+            if (scene == SC_FIGHT && F[0].st != ST_KO) {
+              float ax = F[0].x, ay = GROUND + 9.0f + sinf(gframe * 0.15f) * 2.0f;
+              tri(ax, ay - 2, ax - 10, ay + 14, ax + 10, ay + 14, C(0, 0, 0, 230));
+              tri(ax, ay, ax - 8, ay + 12, ax + 8, ay + 12, C(F[0].ar, F[0].ag, F[0].ab, 255));
+            }
+            for (i = 0; i < 4; i++) {
+              if (projs[i].active) {
+                circ(projs[i].x, projs[i].y, 13.0f, C(F[projs[i].owner].ar, F[projs[i].owner].ag, F[projs[i].owner].ab, 90));
+                circ(projs[i].x, projs[i].y, 8.0f, C(F[projs[i].owner].ar, F[projs[i].owner].ag, F[projs[i].owner].ab, 255));
+                circ(projs[i].x, projs[i].y, 4.0f, C(255, 255, 255, 255));
+              }
+            }
+            for (i = 0; i < 120; i++) {
+              if (parts[i].life > 0) {
+                int al = parts[i].life * 14;
+                if (al > 255) al = 255;
+                circ(parts[i].x, parts[i].y, parts[i].r, C(parts[i].cr, parts[i].cg, parts[i].cb, al));
+              }
+            }
+            if (setBox && scene == SC_FIGHT) {
+              for (i = 0; i < 2; i++) {
+                float reach, y0, y1, kb;
+                int a0, a1, dmg, stun;
+                rect(F[i].x - 11.0f * F[i].scale, F[i].y - 72.0f * F[i].scale, 22.0f * F[i].scale, 72.0f * F[i].scale, C(0, 255, 0, 70));
+                if (atk_params(&F[i], &reach, &y0, &y1, &a0, &a1, &dmg, &kb, &stun) && F[i].t >= a0 && F[i].t <= a1) {
+                  float x0 = F[i].x + F[i].dir * 6.0f, x1 = F[i].x + F[i].dir * reach * F[i].scale;
+                  rect(fminf(x0, x1), F[i].y - y1 * F[i].scale, fabsf(x1 - x0), (y1 - y0) * F[i].scale, C(255, 0, 0, 110));
+                }
+              }
+            }
+            OX = 0; OY = 0;
+          }
+
+          static void draw_bar(float x, float y, float w, float h, float frac, u32 fg, int rtl) {
+            rect(x - 2, y - 2, w + 4, h + 4, C(0, 0, 0, 220));
+            rect(x, y, w, h, C(50, 16, 24, 255));
+            frac = clampf(frac, 0, 1);
+            if (rtl) rect(x + w * (1.0f - frac), y, w * frac, h, fg);
+            else rect(x, y, w * frac, h, fg);
+          }
+
+          static const char *opp_title(int i) { return tr(OPP[i].ten, OPP[i].tpt); }
+          static const char *act_name(int a) { return tr(ACT_EN[a], ACT_PT[a]); }
+
+          static void draw_hud(void) {
+            char b[64];
+            int i;
+            float pf = (float)F[0].hp / F[0].maxhp, ef = (float)F[1].hp / F[1].maxhp;
+            draw_bar(16, 12, 160, 12, pf, pf > 0.3f ? C(80, 220, 120, 255) : C(255, 80, 70, 255), 0);
+            draw_bar(224, 12, 160, 12, ef, ef > 0.3f ? C(240, 190, 60, 255) : C(255, 80, 70, 255), 1);
+            draw_bar(16, 28, 100, 5, F[0].energy / 100.0f, C(90, 200, 255, 255), 0);
+            draw_bar(284, 28, 100, 5, F[1].energy / 100.0f, C(190, 120, 255, 255), 1);
+            text(16, 36, 0.45f, C(255, 255, 255, 255), tr("YOU", "VOCÊ"));
+            text(384 - textw(OPP[curOpp].name, 0.45f), 36, 0.45f, C(255, 255, 255, 255), OPP[curOpp].name);
+            if (timerF > 0) snprintf(b, sizeof b, "%d", (timerF + 59) / 60); else snprintf(b, sizeof b, "--");
+            texts(200, 8, 0.8f, C(255, 240, 200, 255), b);
+            if (mode != M_TRAINING) {
+              for (i = 0; i < needWins; i++) {
+                circ(20 + i * 12, 54, 4, wins[0] > i ? C(255, 220, 90, 255) : C(70, 30, 40, 255));
+                circ(380 - i * 12, 54, 4, wins[1] > i ? C(255, 220, 90, 255) : C(70, 30, 40, 255));
+              }
+            }
+            if (F[0].comboN >= 2) { snprintf(b, sizeof b, "%d %s", F[0].comboN, tr("HITS", "GOLPES")); texts(70, 70, 0.7f, C(255, 220, 90, 255), b); }
+            if (fs == FS_INTRO) {
+              if (fst < 70) {
+                if (mode == M_TRAINING) snprintf(b, sizeof b, "%s", tr("TRAINING", "TREINO"));
+                else if (needWins > 1 && wins[0] == needWins - 1 && wins[1] == needWins - 1) snprintf(b, sizeof b, "%s", tr("FINAL ROUND", "ROUND FINAL"));
+                else snprintf(b, sizeof b, "ROUND %d", roundNo);
+                if (mode == M_STORY && roundNo == 1) {
+                  snprintf(b, sizeof b, "%s %d - %s %d", tr("ACT", "ATO"), storyAct + 1, tr("FIGHT", "LUTA"), storyFight + 1);
+                  texts(200, 56, 0.6f, C(255, 220, 140, 255), b);
+                  snprintf(b, sizeof b, "ROUND %d", roundNo);
+                }
+                texts(200, 80, 1.3f, C(255, 255, 255, 255), b);
+                texts(200, 128, 0.6f, C(255, 200, 160, 255), opp_title(curOpp));
+              } else texts(200, 80, 1.5f, C(255, 70, 80, 255), tr("FIGHT!", "LUTE!"));
+            } else if (fs == FS_KO) {
+              if (koWinner < 0) texts(200, 80, 1.4f, C(255, 255, 255, 255), tr("DRAW", "EMPATE"));
+              else if (timerF == 0 && mode != M_TRAINING && F[0].hp > 0 && F[1].hp > 0) texts(200, 80, 1.4f, C(255, 255, 255, 255), tr("TIME UP", "TEMPO ESGOTADO"));
+              else texts(200, 80, 1.8f, C(255, 50, 60, 255), "K.O.");
+            }
+            if (paused) {
+              rect(0, 0, 400, 240, C(0, 0, 0, 150));
+              texts(200, 90, 1.3f, C(255, 255, 255, 255), tr("PAUSED", "PAUSADO"));
+            }
+          }
+
+          /* ------------------------------------------------------------ UI helpers */
+          static void button(float x, float y, float w, float h, const char *s, int sel) {
+            rect(x, y, w, h, sel ? C(255, 60, 80, 255) : C(100, 24, 40, 255));
+            rect(x + 2, y + 2, w - 4, h - 4, sel ? C(70, 14, 30, 255) : C(26, 8, 18, 255));
+            textc(x + w * 0.5f, y + h * 0.5f - 9.0f, 0.5f, sel ? C(255, 220, 220, 255) : C(210, 170, 175, 255), s);
+          }
+
+          static void bottom_bg(const char *title) {
+            rect(0, 0, 320, 240, C(14, 6, 12, 255));
+            rect(0, 0, 320, 3, C(255, 50, 70, 255));
+            rect(0, 237, 320, 3, C(255, 50, 70, 255));
+            if (toastT > 0) texts(160, 6, 0.5f, C(255, 225, 110, 255), toastBuf);
+            else if (title) texts(160, 6, 0.6f, C(255, 90, 100, 255), title);
+          }
+
+          static void draw_money(float x, float y) {
+            char b[32];
+            coin_icon(x + 8, y + 9, 7);
+            snprintf(b, sizeof b, "%d", sv.coins);
+            text(x + 20, y, 0.5f, C(255, 230, 150, 255), b);
+            gem_icon(x + 92, y + 9, 7);
+            snprintf(b, sizeof b, "%d", sv.gems);
+            text(x + 104, y, 0.5f, C(180, 240, 255, 255), b);
+          }
+
+          static int nav(int sel, int n, u32 kD) {
+            int old = sel;
+            if (kD & KEY_DDOWN) sel = (sel + 1) % n;
+            if (kD & KEY_DUP) sel = (sel + n - 1) % n;
+            if (sel != old) sfx(SFX_MOVE);
+            return sel;
+          }
+
+          static int gnav(int sel, int n, int cols, u32 kD) {
+            int old = sel;
+            if ((kD & KEY_DRIGHT) && sel % cols < cols - 1 && sel + 1 < n) sel++;
+            if ((kD & KEY_DLEFT) && sel % cols > 0) sel--;
+            if (kD & KEY_DDOWN) { if (sel + cols < n) sel += cols; else sel = sel % cols; }
+            if (kD & KEY_DUP) {
+              if (sel - cols >= 0) sel -= cols;
+              else { int last = ((n - 1) / cols) * cols + sel % cols; if (last >= n) last -= cols; sel = last; }
+            }
+            if (sel != old) sfx(SFX_MOVE);
+            return sel;
+          }
+
+          static int list_hit(touchPosition tp, float x0, float y0, float w, float h, float gap, int n) {
+            int i;
+            for (i = 0; i < n; i++) {
+              float y = y0 + i * (h + gap);
+              if (tp.px >= x0 && tp.px <= x0 + w && tp.py >= y && tp.py <= y + h) return i;
+            }
+            return -1;
+          }
+
+          static int grid_hit(touchPosition tp, float x0, float y0, float w, float h, float gx, float gy, int cols, int n) {
+            int i;
+            for (i = 0; i < n; i++) {
+              float x = x0 + (i % cols) * (w + gx), y = y0 + (i / cols) * (h + gy);
+              if (tp.px >= x && tp.px <= x + w && tp.py >= y && tp.py <= y + h) return i;
+            }
+            return -1;
+          }
+
+          static void scroll_fix(int sel, int *top, int vis) {
+            if (sel < *top) *top = sel;
+            if (sel >= *top + vis) *top = sel - vis + 1;
+            if (*top < 0) *top = 0;
+          }
+
+          static int slist_hit(touchPosition tp, float x0, float y0, float w, float h, float gap, int top, int vis, int n) {
+            int i;
+            for (i = 0; i < vis && top + i < n; i++) {
+              float y = y0 + i * (h + gap);
+              if (tp.px >= x0 && tp.px <= x0 + w && tp.py >= y && tp.py <= y + h) return top + i;
+            }
+            return -1;
+          }
+
+          static void draw_slist(const char **lab, int n, int sel, int top, float x0, float y0, float w, float h, float gap, int vis) {
+            int i;
+            for (i = 0; i < vis && top + i < n; i++) button(x0, y0 + i * (h + gap), w, h, lab[top + i], top + i == sel);
+            if (top > 0) tri(305, y0 + 8, 299, y0 + 16, 311, y0 + 16, C(255, 90, 100, 255));
+            if (top + vis < n) { float yb = y0 + vis * (h + gap) - gap - 8; tri(305, yb + 8, 299, yb, 311, yb, C(255, 90, 100, 255)); }
+          }
+
+          /* ----------------------------------------------------------------- shop */
+          static int shop_count(int tab) { return tab == 0 ? NSW : (tab == 1 ? NAR : (tab == 2 ? NGE : NSP + NPASS)); }
+
+          static const char *shop_name(int tab, int i) {
+            if (tab == 0) return tr(SWORDS[i].en, SWORDS[i].pt);
+            if (tab == 1) return tr(ARMORS[i].en, ARMORS[i].pt);
+            if (tab == 2) return tr(GEARS[i].en, GEARS[i].pt);
+            if (i < NSP) return tr(SPECS[i].en, SPECS[i].pt);
+            return tr(PASS[i - NSP].en, PASS[i - NSP].pt);
+          }
+
+          static int shop_owned(int tab, int i) {
+            if (tab == 0) return (sv.swordOwn >> i) & 1;
+            if (tab == 1) return (sv.armorOwn >> i) & 1;
+            if (tab == 2) return (sv.gearOwn >> i) & 1;
+            if (i < NSP) return (sv.specOwn >> i) & 1;
+            return sv.passLv[i - NSP] > 0;
+          }
+
+          static int shop_equipped(int tab, int i) {
+            if (tab == 0) return sv.swordEq == i;
+            if (tab == 1) return sv.armorEq == i;
+            if (tab == 2) return sv.gearEq == i;
+            if (i < NSP) return sv.specEq == i;
+            return 0;
+          }
+
+          static void shop_price(int tab, int i, int *coins, int *gems) {
+            *coins = 0; *gems = 0;
+            if (tab == 0) { *coins = SWORDS[i].coins; *gems = SWORDS[i].gems; }
+            else if (tab == 1) { *coins = ARMORS[i].coins; *gems = ARMORS[i].gems; }
+            else if (tab == 2) { *coins = GEARS[i].coins; *gems = GEARS[i].gems; }
+            else if (i < NSP) { *coins = SPECS[i].coins; *gems = SPECS[i].gems; }
+            else { int lv = sv.passLv[i - NSP]; *coins = lv >= 5 ? -1 : PASS[i - NSP].base * (lv + 1); }
+          }
+
+          static void shop_action(void) {
+            int tab = shopTab, i = shopSel, coins, gems;
+            char b[64];
+            shop_price(tab, i, &coins, &gems);
+            if (tab == 3 && i >= NSP) {
+              int j = i - NSP;
+              if (coins < 0) { toast(tr("Already at max level", "Já está no nível máximo")); sfx(SFX_ERR); return; }
+              if (sv.coins < coins) { toast(tr("Not enough coins!", "Moedas insuficientes!")); sfx(SFX_ERR); return; }
+              sv.coins -= coins; sv.passLv[j]++;
+              snprintf(b, sizeof b, "%s %d", tr("Upgraded to level", "Evoluiu para o nível"), sv.passLv[j]);
+              toast(b); sfx(SFX_COIN); save_game();
+              return;
+            }
+            if (!shop_owned(tab, i)) {
+              if (sv.coins < coins) { toast(tr("Not enough coins!", "Moedas insuficientes!")); sfx(SFX_ERR); return; }
+              if (sv.gems < gems) { toast(tr("Not enough gems!", "Gemas insuficientes!")); sfx(SFX_ERR); return; }
+              sv.coins -= coins; sv.gems -= gems;
+              if (tab == 0) sv.swordOwn |= 1 << i;
+              else if (tab == 1) sv.armorOwn |= 1 << i;
+              else if (tab == 2) sv.gearOwn |= 1 << i;
+              else sv.specOwn |= 1 << i;
+              sfx(SFX_COIN);
+              toast(tr("Purchased and equipped!", "Comprado e equipado!"));
+            } else {
+              sfx(SFX_SEL);
+              toast(tr("Equipped!", "Equipado!"));
+            }
+            if (tab == 0) sv.swordEq = i;
+            else if (tab == 1) sv.armorEq = i;
+            else if (tab == 2) sv.gearEq = i;
+            else sv.specEq = i;
+            save_game();
+          }
+
+          static void shop_detail(char d[5][64]) {
+            int tab = shopTab, i = shopSel, coins, gems;
+            int j;
+            const GearDef *g;
+            memset(d, 0, 5 * 64);
+            snprintf(d[0], 64, "%s", shop_name(tab, i));
+            if (tab == 0) {
+              snprintf(d[1], 64, "%s +%d%%", tr("Damage", "Dano"), SWORDS[i].dmg);
+              snprintf(d[2], 64, "%s +%d", tr("Reach", "Alcance"), SWORDS[i].reach);
+            } else if (tab == 1) {
+              snprintf(d[1], 64, "%s +%d", tr("Health", "Vida"), ARMORS[i].hp);
+              snprintf(d[2], 64, "%s +%d%%", tr("Defense", "Defesa"), ARMORS[i].def);
+            } else if (tab == 2) {
+              g = &GEARS[i];
+              if (g->kind == 0) snprintf(d[1], 64, "%s", tr("No bonus", "Sem bônus"));
+              else if (g->kind == 1) snprintf(d[1], 64, "%s +%d%%", tr("Move speed", "Velocidade"), g->val);
+              else if (g->kind == 2) snprintf(d[1], 64, "%s +%d%%", tr("Energy gain", "Ganho de energia"), g->val);
+              else if (g->kind == 3) snprintf(d[1], 64, "%s +%d%%", tr("Coins earned", "Moedas ganhas"), g->val);
+              else if (g->kind == 4) snprintf(d[1], 64, "%s %d%%", tr("Crit chance", "Chance de crítico"), g->val);
+              else snprintf(d[1], 64, "%s", tr("Slowly regains health", "Recupera vida aos poucos"));
+            } else if (i < NSP) {
+              snprintf(d[1], 64, "%s", tr(SPECS[i].den, SPECS[i].dpt));
+              snprintf(d[2], 64, "%s %d", tr("Energy cost", "Custo de energia"), SPECS[i].cost);
+            } else {
+              j = i - NSP;
+              snprintf(d[1], 64, "%s", tr(PASS[j].den, PASS[j].dpt));
+              snprintf(d[2], 64, "%s %d/5", tr("Level", "Nível"), sv.passLv[j]);
+            }
+            shop_price(tab, i, &coins, &gems);
+            if (tab == 3 && i >= NSP) {
+              if (coins < 0) snprintf(d[3], 64, "%s", tr("MAX LEVEL", "NÍVEL MÁXIMO"));
+              else snprintf(d[3], 64, "%s: %d", tr("Next level costs", "Próximo nível custa"), coins);
+            } else if (shop_equipped(tab, i)) snprintf(d[3], 64, "%s", tr("Equipped", "Equipado"));
+            else if (shop_owned(tab, i)) snprintf(d[3], 64, "%s", tr("Owned", "Comprado"));
+            else if (gems > 0) snprintf(d[3], 64, "%s: %d %s", tr("Price", "Preço"), gems, tr("gems", "gemas"));
+            else snprintf(d[3], 64, "%s: %d %s", tr("Price", "Preço"), coins, tr("coins", "moedas"));
+          }
+
+          static void shop_row(float y, int tab, int i, int sel) {
+            char b[40];
+            int coins, gems;
+            float x = 8, w = 284, h = 22;
+            rect(x, y, w, h, sel ? C(255, 60, 80, 255) : C(100, 24, 40, 255));
+            rect(x + 2, y + 2, w - 4, h - 4, sel ? C(70, 14, 30, 255) : C(26, 8, 18, 255));
+            text(x + 8, y + 2, 0.45f, sel ? C(255, 230, 230, 255) : C(215, 175, 180, 255), shop_name(tab, i));
+            shop_price(tab, i, &coins, &gems);
+            if (tab == 3 && i >= NSP) {
+              if (coins < 0) snprintf(b, sizeof b, "MAX");
+              else snprintf(b, sizeof b, "Lv%d  %d", sv.passLv[i - NSP], coins);
+              text(x + w - 8 - textw(b, 0.42f) - 14, y + 3, 0.42f, C(255, 230, 150, 255), b);
+              if (coins >= 0) coin_icon(x + w - 14, y + 11, 5);
+            } else if (shop_equipped(tab, i)) {
+              snprintf(b, sizeof b, "%s", tr("EQUIPPED", "EQUIPADO"));
+              text(x + w - 8 - textw(b, 0.42f), y + 3, 0.42f, C(120, 255, 160, 255), b);
+            } else if (shop_owned(tab, i)) {
+              snprintf(b, sizeof b, "%s", tr("OWNED", "COMPRADO"));
+              text(x + w - 8 - textw(b, 0.42f), y + 3, 0.42f, C(200, 200, 210, 255), b);
+            } else if (gems > 0) {
+              snprintf(b, sizeof b, "%d", gems);
+              text(x + w - 8 - textw(b, 0.42f) - 14, y + 3, 0.42f, C(180, 240, 255, 255), b);
+              gem_icon(x + w - 14, y + 11, 6);
+            } else {
+              snprintf(b, sizeof b, "%d", coins);
+              text(x + w - 8 - textw(b, 0.42f) - 14, y + 3, 0.42f, C(255, 230, 150, 255), b);
+              coin_icon(x + w - 14, y + 11, 5);
+            }
+          }
+
+          /* -------------------------------------------------------------- settings */
+          static char setBuf[10][44];
+          static const char *setLab[10];
+          static char actBuf[NACT][72];
+          static const char *actLab[NACT];
+
+          static void build_settings(void) {
+            int i;
+            snprintf(setBuf[0], 44, "%s: %s", tr("Language", "Idioma"), sv.lang ? "Português" : "English");
+            snprintf(setBuf[1], 44, "%s: %s", tr("Difficulty", "Dificuldade"), setDiff == 0 ? tr("Easy", "Fácil") : (setDiff == 1 ? tr("Normal", "Normal") : tr("Hard", "Difícil")));
+            snprintf(setBuf[2], 44, "%s: %d", tr("Rounds to win", "Rounds para vencer"), setRounds);
+            snprintf(setBuf[3], 44, "%s: %d s", tr("Round time", "Tempo do round"), timeVals[setTimeIdx]);
+            snprintf(setBuf[4], 44, "%s: %s", tr("Screen shake", "Tremor de tela"), setShake ? tr("On", "Ligado") : tr("Off", "Desligado"));
+            snprintf(setBuf[5], 44, "%s: %s", tr("Show hitboxes", "Mostrar hitboxes"), setBox ? tr("On", "Ligado") : tr("Off", "Desligado"));
+            snprintf(setBuf[6], 44, "%s: %s", tr("Music", "Música"), sv.music ? tr("On", "Ligado") : tr("Off", "Desligado"));
+            snprintf(setBuf[7], 44, "%s: %s", tr("Sound effects", "Efeitos sonoros"), sv.sfx ? tr("On", "Ligado") : tr("Off", "Desligado"));
+            snprintf(setBuf[8], 44, "%s", eraseArm ? tr("Press A again to ERASE!", "Aperte A de novo para APAGAR!") : tr("Erase save data", "Apagar progresso"));
+            snprintf(setBuf[9], 44, "%s", tr("Back", "Voltar"));
+            for (i = 0; i < 10; i++) setLab[i] = setBuf[i];
+          }
+
+          static void change_setting(int row, int d) {
+            switch (row) {
+              case 0: sv.lang = !sv.lang; break;
+              case 1: setDiff = (setDiff + 3 + d) % 3; break;
+              case 2: setRounds = ((setRounds - 1 + 3 + d) % 3) + 1; break;
+              case 3: setTimeIdx = (setTimeIdx + 3 + d) % 3; break;
+              case 4: setShake = !setShake; break;
+              case 5: setBox = !setBox; break;
+              case 6: sv.music = !sv.music; break;
+              case 7: sv.sfx = !sv.sfx; break;
+              default: break;
+            }
+          }
+
+          static void build_acts(void) {
+            int a;
+            for (a = 0; a < NACT; a++) {
+              if (a < sv.actsUnlocked) snprintf(actBuf[a], sizeof actBuf[a], "%s %d: %s", tr("Act", "Ato"), a + 1, act_name(a));
+              else snprintf(actBuf[a], sizeof actBuf[a], "%s %d: ???  (%s)", tr("Act", "Ato"), a + 1, tr("locked", "bloqueado"));
+              actLab[a] = actBuf[a];
+            }
+          }
+
+          static void menu_action(int i) {
+            sfx(SFX_SEL);
+            switch (i) {
+              case 0:
+                if (sv.curFight > 2) { scene = SC_ACTS; actsSel = NACT - 1; }
+                else if (sv.curFight == 0) open_storytxt(sv.curAct);
+                else start_story_fight(sv.curAct, sv.curFight);
+                break;
+              case 1: scene = SC_ACTS; actsSel = clampi(sv.curAct, 0, NACT - 1); break;
+              case 2: start_match(M_SURVIVAL, 0); break;
+              case 3: scene = SC_PICK; pickSel = 0; style_opp(&F[1], 0); break;
+              case 4: start_match(M_TRAINING, 0); break;
+              case 5: shop_enter(); break;
+              case 6: scene = SC_SET; setSel = 0; setTop = 0; eraseArm = 0; break;
+              case 7: scene = SC_HOW; howPage = 0; break;
+              case 8: toast(save_game() ? tr("Game saved!", "Jogo salvo!") : tr("Could not save (no SD card?)", "Não foi possível salvar")); break;
+              default: save_game(); running = 0; break;
+            }
+          }
+
+          static void update_demo(void) {
+            Inp none;
+            memset(&none, 0, sizeof none);
+            update_fighter(&F[0], &F[1], none, 0);
+            update_fighter(&F[1], &F[0], none, 0);
+            update_parts();
+          }
+
+          static void update(u32 kD, u32 kH, circlePosition cp, touchPosition tp) {
+            int hit = -1, touch = (kD & KEY_TOUCH) != 0, i;
+            if (toastT > 0) toastT--;
+            if (scene == SC_MENU) {
+              update_demo();
+              menuSel = gnav(menuSel, 10, 2, kD);
+              if (touch) { hit = grid_hit(tp, 14, 30, 142, 30, 8, 6, 2, 10); if (hit >= 0) menuSel = hit; }
+              if ((kD & KEY_A) || hit >= 0) menu_action(menuSel);
+            } else if (scene == SC_ACTS) {
+              update_demo();
+              actsSel = nav(actsSel, NACT, kD);
+              if (touch) { hit = list_hit(tp, 20, 34, 280, 30, 5, NACT); if (hit >= 0) actsSel = hit; }
+              if (kD & KEY_B) menu_enter();
+              else if ((kD & KEY_A) || hit >= 0) {
+                if (actsSel < sv.actsUnlocked) { sfx(SFX_SEL); open_storytxt(actsSel); }
+                else { sfx(SFX_ERR); toast(tr("Finish the previous act first", "Termine o ato anterior primeiro")); }
+              }
+            } else if (scene == SC_STORYTXT) {
+              update_demo();
+              if (kD & KEY_B) menu_enter();
+              else if ((kD & KEY_A) || touch) {
+                sfx(SFX_SEL);
+                if (txtKind == 0) start_story_fight(txtAct, 0); else menu_enter();
+              }
+            } else if (scene == SC_PICK) {
+              update_demo();
+              pickSel = nav(pickSel, 8, kD);
+              if (touch) { hit = list_hit(tp, 30, 26, 260, 24, 3, 8); if (hit >= 0) pickSel = hit; }
+              if (pickSel < NOPP) style_opp(&F[1], pickSel);
+              if (kD & KEY_B) menu_enter();
+              else if ((kD & KEY_A) || hit >= 0) {
+                sfx(SFX_SEL);
+                if (pickSel >= NOPP) menu_enter(); else start_match(M_FREE, pickSel);
+              }
+            } else if (scene == SC_SET) {
+              update_demo();
+              setSel = nav(setSel, 10, kD);
+              if (setSel != 8) eraseArm = 0;
+              scroll_fix(setSel, &setTop, 7);
+              if (kD & KEY_DLEFT) { change_setting(setSel, -1); sfx(SFX_MOVE); }
+              if (kD & KEY_DRIGHT) { change_setting(setSel, 1); sfx(SFX_MOVE); }
+              if (touch) { hit = slist_hit(tp, 20, 28, 270, 24, 3, setTop, 7, 10); if (hit >= 0) setSel = hit; }
+              if ((kD & KEY_A) || hit >= 0) {
+                sfx(SFX_SEL);
+                if (setSel == 9) menu_enter();
+                else if (setSel == 8) {
+                  if (!eraseArm) eraseArm = 1;
+                  else { sv_defaults(); save_game(); eraseArm = 0; toast(tr("Save data erased", "Progresso apagado")); }
+                } else change_setting(setSel, 1);
+              }
+              if (kD & KEY_B) menu_enter();
+            } else if (scene == SC_HOW) {
+              update_demo();
+              if (kD & (KEY_DRIGHT | KEY_DLEFT | KEY_DDOWN | KEY_DUP)) { howPage = (howPage + 1) % 3; sfx(SFX_MOVE); }
+              if (touch && tp.py < 196) { howPage = (howPage + 1) % 3; sfx(SFX_MOVE); }
+              if ((kD & (KEY_A | KEY_B)) || (touch && tp.py >= 196)) menu_enter();
+            } else if (scene == SC_SHOP) {
+              int n = shop_count(shopTab), pv[4];
+              update_demo();
+              if (kD & (KEY_DRIGHT | KEY_R)) { shopTab = (shopTab + 1) % 4; shopSel = 0; shopTop = 0; sfx(SFX_MOVE); }
+              if (kD & (KEY_DLEFT | KEY_L)) { shopTab = (shopTab + 3) % 4; shopSel = 0; shopTop = 0; sfx(SFX_MOVE); }
+              n = shop_count(shopTab);
+              shopSel = nav(shopSel, n, kD);
+              scroll_fix(shopSel, &shopTop, 6);
+              if (touch) {
+                for (i = 0; i < 4; i++)
+                  if (tp.px >= 8 + i * 78 && tp.px <= 82 + i * 78 && tp.py >= 26 && tp.py <= 46) { shopTab = i; shopSel = 0; shopTop = 0; sfx(SFX_MOVE); }
+                hit = slist_hit(tp, 8, 52, 284, 22, 3, shopTop, 6, shop_count(shopTab));
+                if (hit >= 0) { if (hit != shopSel) sfx(SFX_MOVE); shopSel = hit; }
+                if (tp.px >= 200 && tp.px <= 312 && tp.py >= 208 && tp.py <= 234) shop_action();
+              }
+              if (kD & KEY_A) shop_action();
+              if (kD & KEY_B) menu_enter();
+              pv[0] = sv.swordEq; pv[1] = sv.armorEq; pv[2] = sv.gearEq; pv[3] = sv.specEq;
+              if (shopSel < shop_count(shopTab) && (shopTab < 3)) pv[shopTab] = shopSel;
+              apply_loadout_ex(&F[0], pv[0], pv[1], pv[2], pv[3]);
+            } else if (scene == SC_FIGHT) {
+              if (paused) {
+                pauseSel = nav(pauseSel, 3, kD);
+                if (touch) { hit = list_hit(tp, 30, 60, 260, 32, 8, 3); if (hit >= 0) pauseSel = hit; }
+                if ((kD & (KEY_B | KEY_START))) paused = 0;
+                else if ((kD & KEY_A) || hit >= 0) {
+                  if (pauseSel == 0) paused = 0;
+                  else if (pauseSel == 1) {
+                    if (mode == M_STORY) start_story_fight(storyAct, storyFight);
+                    else start_match(mode, mode == M_SURVIVAL ? 0 : curOpp);
+                  } else menu_enter();
+                }
+                return;
+              }
+              if ((kD & KEY_START) || (touch && tp.px >= 236 && tp.py >= 196)) { paused = 1; pauseSel = 0; return; }
+              update_fight(kD, kH, cp);
+            } else if (scene == SC_RESULT) {
+              update_demo();
+              resSel = nav(resSel, resN, kD);
+              if (touch) { hit = list_hit(tp, 30, 124, 260, 30, 6, resN); if (hit >= 0) resSel = hit; }
+              if ((kD & KEY_A) || hit >= 0) {
+                sfx(SFX_SEL);
+                switch (resAct[resSel]) {
+                  case RA_NEXT: start_story_fight(storyAct, storyFight + 1); break;
+                  case RA_NEXTACT: open_storytxt(storyAct + 1); break;
+                  case RA_ENDING: txtKind = 1; scene = SC_STORYTXT; demo_init(); music_play(0, 0); break;
+                  case RA_RETRY: start_story_fight(storyAct, storyFight); break;
+                  case RA_AGAIN: if (mode == M_SURVIVAL) start_match(M_SURVIVAL, 0); else start_match(mode, curOpp); break;
+                  case RA_SHOP: shop_enter(); break;
+                  default: menu_enter(); break;
+                }
+              }
+            }
+          }
+
+          static void draw_top(void) {
+            char b[96];
+            int i;
+            draw_world();
+            if (scene == SC_FIGHT) draw_hud();
+            else if (scene == SC_MENU || scene == SC_PICK || scene == SC_SET || scene == SC_HOW) {
+              texts(200, 22, 1.5f, C(255, 70, 90, 255), "SHADOW DUEL");
+              texts(200, 74, 0.5f, C(255, 220, 200, 255), tr("An original shadow fighting game", "Um jogo de luta de sombras original"));
+              if (scene == SC_PICK && pickSel < NOPP) {
+                snprintf(b, sizeof b, "%s - %s", OPP[pickSel].name, opp_title(pickSel));
+                texts(200, 205, 0.55f, C(255, 255, 255, 255), b);
+              }
+              if (scene == SC_MENU) {
+                snprintf(b, sizeof b, "%s %d - %s %d", tr("Act", "Ato"), clampi(sv.curAct, 0, NACT - 1) + 1, tr("Fight", "Luta"), clampi(sv.curFight, 0, 2) + 1);
+                if (sv.curFight > 2) snprintf(b, sizeof b, "%s", tr("Story complete!", "História completa!"));
+                texts(200, 100, 0.5f, C(255, 225, 140, 255), b);
+              }
+            } else if (scene == SC_ACTS) {
+              rect(40, 28, 320, 128, C(0, 0, 0, 160));
+              snprintf(b, sizeof b, "%s %d", tr("ACT", "ATO"), actsSel + 1);
+              texts(200, 34, 0.6f, C(255, 190, 120, 255), b);
+              if (actsSel < sv.actsUnlocked) {
+                texts(200, 56, 0.8f, C(255, 255, 255, 255), act_name(actsSel));
+                for (i = 0; i < 3; i++) texts(200, 92 + i * 18.0f, 0.42f, C(235, 215, 215, 255), tr(ACT_TXT_EN[actsSel][i], ACT_TXT_PT[actsSel][i]));
+              } else texts(200, 80, 0.8f, C(180, 140, 150, 255), tr("Locked", "Bloqueado"));
+            } else if (scene == SC_STORYTXT) {
+              rect(30, 30, 340, 140, C(0, 0, 0, 175));
+              if (txtKind == 0) {
+                snprintf(b, sizeof b, "%s %d", tr("ACT", "ATO"), txtAct + 1);
+                texts(200, 36, 0.65f, C(255, 190, 120, 255), b);
+                texts(200, 60, 0.85f, C(255, 255, 255, 255), act_name(txtAct));
+                for (i = 0; i < 3; i++) texts(200, 100 + i * 20.0f, 0.43f, C(235, 215, 215, 255), tr(ACT_TXT_EN[txtAct][i], ACT_TXT_PT[txtAct][i]));
+              } else {
+                texts(200, 40, 0.9f, C(255, 220, 90, 255), tr("THE END", "FIM"));
+                for (i = 0; i < 3; i++) texts(200, 90 + i * 22.0f, 0.43f, C(235, 215, 215, 255), tr(END_EN[i], END_PT[i]));
+              }
+            } else if (scene == SC_SHOP) {
+              char dl[5][64];
+              rect(212, 14, 182, 168, C(0, 0, 0, 175));
+              rect(212, 14, 182, 2, C(255, 60, 80, 255));
+              shop_detail(dl);
+              text(220, 20, 0.55f, C(255, 225, 140, 255), dl[0]);
+              text(220, 52, 0.42f, C(235, 220, 220, 255), dl[1]);
+              text(220, 74, 0.42f, C(235, 220, 220, 255), dl[2]);
+              text(220, 130, 0.45f, C(160, 245, 190, 255), dl[3]);
+              draw_money(14, 8);
+            } else if (scene == SC_RESULT) {
+              if (matchWon) texts(200, 30, 1.5f, C(255, 220, 90, 255), tr("VICTORY", "VITÓRIA"));
+              else texts(200, 30, 1.5f, C(255, 70, 80, 255), tr("DEFEAT", "DERROTA"));
+              if (mode == M_SURVIVAL) { snprintf(b, sizeof b, "%s: %d", tr("Fights won", "Lutas vencidas"), survWins); texts(200, 80, 0.7f, C(255, 255, 255, 255), b); }
+              if (mode == M_STORY) {
+                snprintf(b, sizeof b, "%s %d - %s %d: %s", tr("Act", "Ato"), storyAct + 1, tr("Fight", "Luta"), storyFight + 1, OPP[curOpp].name);
+                texts(200, 80, 0.55f, C(255, 255, 255, 255), b);
+                if (matchWon && actDone) texts(200, 104, 0.6f, C(255, 220, 90, 255), tr("ACT COMPLETE!", "ATO COMPLETO!"));
+              }
+              snprintf(b, sizeof b, "%s: %d", tr("Best combo", "Melhor combo"), maxCombo);
+              texts(200, 130, 0.5f, C(255, 200, 160, 255), b);
+              if (rewCoins > 0 || rewGems > 0) {
+                rect(110, 150, 180, 34, C(0, 0, 0, 170));
+                coin_icon(130, 167, 8);
+                snprintf(b, sizeof b, "+%d", rewCoins);
+                text(144, 156, 0.6f, C(255, 230, 150, 255), b);
+                if (rewGems > 0) {
+                  gem_icon(222, 167, 8);
+                  snprintf(b, sizeof b, "+%d", rewGems);
+                  text(236, 156, 0.6f, C(180, 240, 255, 255), b);
+                }
+              }
+            }
+          }
+
+          static void draw_bottom(void) {
+            char b[96];
+            int i;
+            OX = 0; OY = 0;
+            if (scene == SC_MENU) {
+              const char *ml[10];
+              ml[0] = tr("Continue", "Continuar"); ml[1] = tr("Acts", "Atos"); ml[2] = tr("Survival", "Sobrevivência");
+              ml[3] = tr("Free duel", "Duelo livre"); ml[4] = tr("Training", "Treino"); ml[5] = tr("Shop", "Loja");
+              ml[6] = tr("Settings", "Opções"); ml[7] = tr("How to play", "Como jogar"); ml[8] = tr("Save game", "Salvar jogo"); ml[9] = tr("Exit", "Sair");
+              bottom_bg(tr("MAIN MENU", "MENU PRINCIPAL"));
+              for (i = 0; i < 10; i++) button(14 + (i % 2) * 150.0f, 30 + (i / 2) * 36.0f, 142, 30, ml[i], i == menuSel);
+              draw_money(16, 214);
+            } else if (scene == SC_ACTS) {
+              bottom_bg(tr("ACTS", "ATOS"));
+              build_acts();
+              for (i = 0; i < NACT; i++) button(20, 34 + i * 35.0f, 280, 30, actLab[i], i == actsSel);
+            } else if (scene == SC_STORYTXT) {
+              bottom_bg(txtKind == 0 ? tr("STORY", "HISTÓRIA") : tr("ENDING", "FINAL"));
+              button(60, 90, 200, 40, txtKind == 0 ? tr("Start", "Começar") : tr("Main menu", "Menu principal"), 1);
+              textc(160, 150, 0.42f, C(170, 120, 130, 255), tr("A / tap: continue    B: back", "A / toque: continuar    B: voltar"));
+            } else if (scene == SC_PICK) {
+              const char *pl[8];
+              bottom_bg(tr("FREE DUEL", "DUELO LIVRE"));
+              for (i = 0; i < NOPP; i++) pl[i] = OPP[i].name;
+              pl[7] = tr("Back", "Voltar");
+              for (i = 0; i < 8; i++) button(30, 26 + i * 27.0f, 260, 24, pl[i], i == pickSel);
+            } else if (scene == SC_SET) {
+              bottom_bg(tr("SETTINGS", "OPÇÕES"));
+              build_settings();
+              draw_slist(setLab, 10, setSel, setTop, 20, 28, 270, 24, 3, 7);
+              if (!audioOk) textc(160, 222, 0.38f, C(255, 160, 120, 255), tr("Audio off: dspfirm.cdc not found on SD", "Sem áudio: dspfirm.cdc não achado no SD"));
+              else textc(160, 222, 0.4f, C(170, 120, 130, 255), tr("Left/Right or tap to change", "Esq/Dir ou toque para mudar"));
+            } else if (scene == SC_HOW) {
+              static const char *HE[3][7] = {
+                {"D-Pad / Circle Pad: move", "A: attack    B: kick", "X or Up: jump", "Y (hold): block", "R: special    L: dash", "START: pause", ""},
+                {"Hits and blocks fill your energy bar.", "Block only works facing the enemy.", "Jump to dodge low kicks and bolts.", "Swords add damage and reach.", "Armor adds health and defense.", "R uses your equipped special.", ""},
+                {"Win fights to earn coins and gems.", "Spend them in the Shop.", "Story: 5 acts of 3 fights each.", "Progress saves automatically.", "You can also use Save game.", "Music needs dspfirm.cdc on the SD.", ""}
+              };
+              static const char *HP[3][7] = {
+                {"D-Pad / Analógico: mover", "A: ataque    B: chute", "X ou Cima: pular", "Y (segurar): bloquear", "R: especial    L: dash", "START: pausar", ""},
+                {"Golpes e defesas enchem a energia.", "Bloquear só funciona de frente.", "Pule para desviar de chutes e raios.", "Espadas dão dano e alcance.", "Armaduras dão vida e defesa.", "R usa o especial equipado.", ""},
+                {"Vença lutas para ganhar moedas e gemas.", "Gaste na Loja.", "História: 5 atos de 3 lutas.", "O progresso salva sozinho.", "Também dá para usar Salvar jogo.", "A música precisa do dspfirm.cdc no SD.", ""}
+              };
+              bottom_bg(tr("HOW TO PLAY", "COMO JOGAR"));
+              for (i = 0; i < 6; i++) text(18, 30 + i * 22.0f, 0.46f, C(240, 220, 220, 255), sv.lang ? HP[howPage][i] : HE[howPage][i]);
+              snprintf(b, sizeof b, "%d/3  %s", howPage + 1, tr("Tap or D-Pad: next page", "Toque ou D-Pad: próxima página"));
+              textc(160, 172, 0.42f, C(170, 120, 130, 255), b);
+              button(80, 202, 160, 28, tr("Back", "Voltar"), 1);
+            } else if (scene == SC_SHOP) {
+              static const char *TE[4] = {"Swords", "Armor", "Gear", "Skills"};
+              static const char *TP[4] = {"Espadas", "Armaduras", "Equip.", "Habilid."};
+              int n = shop_count(shopTab), coins, gems;
+              const char *al;
+              bottom_bg(tr("SHOP", "LOJA"));
+              for (i = 0; i < 4; i++) {
+                rect(8 + i * 78.0f, 26, 74, 20, i == shopTab ? C(255, 60, 80, 255) : C(100, 24, 40, 255));
+                rect(10 + i * 78.0f, 28, 70, 16, i == shopTab ? C(70, 14, 30, 255) : C(26, 8, 18, 255));
+                textc(45 + i * 78.0f, 28, 0.4f, i == shopTab ? C(255, 220, 220, 255) : C(200, 160, 165, 255), sv.lang ? TP[i] : TE[i]);
+              }
+              for (i = 0; i < 6 && shopTop + i < n; i++) shop_row(52 + i * 25.0f, shopTab, shopTop + i, shopTop + i == shopSel);
+              if (shopTop > 0) tri(304, 56, 298, 64, 310, 64, C(255, 90, 100, 255));
+              if (shopTop + 6 < n) tri(304, 200, 298, 192, 310, 192, C(255, 90, 100, 255));
+              draw_money(10, 214);
+              shop_price(shopTab, shopSel, &coins, &gems);
+              if (shopTab == 3 && shopSel >= NSP) al = coins < 0 ? "MAX" : tr("Upgrade", "Evoluir");
+              else if (shop_equipped(shopTab, shopSel)) al = tr("Equipped", "Equipado");
+              else if (shop_owned(shopTab, shopSel)) al = tr("Equip", "Equipar");
+              else al = tr("Buy", "Comprar");
+              button(200, 208, 112, 26, al, 1);
+            } else if (scene == SC_FIGHT) {
+              bottom_bg(mode == M_STORY ? tr("STORY", "HISTÓRIA") : (mode == M_SURVIVAL ? tr("SURVIVAL", "SOBREVIVÊNCIA") : (mode == M_TRAINING ? tr("TRAINING", "TREINO") : tr("FREE DUEL", "DUELO LIVRE"))));
+              if (paused) {
+                const char *pl[3];
+                pl[0] = tr("Resume", "Continuar"); pl[1] = tr("Restart match", "Reiniciar luta"); pl[2] = tr("Quit to menu", "Sair para o menu");
+                for (i = 0; i < 3; i++) button(30, 60 + i * 40.0f, 260, 32, pl[i], i == pauseSel);
+              } else {
+                snprintf(b, sizeof b, "vs %s", OPP[curOpp].name);
+                textc(160, 30, 0.7f, C(255, 255, 255, 255), b);
+                textc(160, 58, 0.45f, C(255, 190, 160, 255), opp_title(curOpp));
+                if (mode == M_STORY) snprintf(b, sizeof b, "%s %d: %s - %s %d/3", tr("Act", "Ato"), storyAct + 1, act_name(storyAct), tr("Fight", "Luta"), storyFight + 1);
+                else if (mode == M_SURVIVAL) snprintf(b, sizeof b, "%s: %d", tr("Fights won", "Lutas vencidas"), survWins);
+                else if (mode == M_TRAINING) snprintf(b, sizeof b, "%s: %d", tr("Best combo", "Melhor combo"), maxCombo);
+                else snprintf(b, sizeof b, "%s %d %s", tr("First to", "Primeiro a"), needWins, tr("rounds", "rounds"));
+                textc(160, 80, 0.45f, C(255, 220, 90, 255), b);
+                text(18, 112, 0.42f, C(200, 170, 175, 255), tr("A Attack   B Kick   Y Block (hold)", "A Ataque   B Chute   Y Bloquear (segurar)"));
+                text(18, 132, 0.42f, C(200, 170, 175, 255), tr("X/Up Jump   L Dash", "X/Cima Pular   L Dash"));
+                snprintf(b, sizeof b, "R: %s (%d %s)", tr(SPECS[F[0].spKind].en, SPECS[F[0].spKind].pt), F[0].spCost, tr("energy", "energia"));
+                text(18, 152, 0.42f, C(150, 220, 255, 255), b);
+                draw_money(16, 200);
+                button(236, 196, 76, 32, tr("Pause", "Pausa"), 0);
+              }
+            } else if (scene == SC_RESULT) {
+              bottom_bg(tr("RESULT", "RESULTADO"));
+              for (i = 0; i < resN; i++) button(30, 124 + i * 36.0f, 260, 30, resLabels[i], i == resSel);
+              draw_money(16, 66);
+              if (rewCoins > 0 || rewGems > 0) textc(160, 40, 0.5f, C(255, 225, 110, 255), tr("Rewards saved!", "Recompensas salvas!"));
+            }
+          }
+
+          int main(int argc, char **argv) {
+            C3D_RenderTarget *top, *bot;
+            (void)argc; (void)argv;
+            gfxInitDefault();
+            C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
+            C2D_Init(C2D_DEFAULT_MAX_OBJECTS);
+            C2D_Prepare();
+            top = C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT);
+            bot = C2D_CreateScreenTarget(GFX_BOTTOM, GFX_LEFT);
+            gBuf = C2D_TextBufNew(8192);
+            srand((unsigned)time(NULL));
+            sv.lang = 1;
+            sv_defaults();
+            load_game();
+            audio_init();
+            menu_enter();
+            if (!audioOk) toast("Audio off: dspfirm.cdc missing");
+            while (aptMainLoop() && running) {
+              circlePosition cp;
+              touchPosition tp;
+              u32 kD, kH;
+              hidScanInput();
+              kD = hidKeysDown(); kH = hidKeysHeld();
+              hidCircleRead(&cp); hidTouchRead(&tp);
+              gframe++;
+              update(kD, kH, cp, tp);
+              audio_update();
+              C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+              C2D_TextBufClear(gBuf);
+              C2D_TargetClear(top, C(0, 0, 0, 255));
+              C2D_SceneBegin(top);
+              zc = 0;
+              draw_top();
+              C2D_TargetClear(bot, C(0, 0, 0, 255));
+              C2D_SceneBegin(bot);
+              zc = 0;
+              draw_bottom();
+              C3D_FrameEnd(0);
+            }
+            save_game();
+            if (audioOk) ndspExit();
+            C2D_TextBufDelete(gBuf);
+            C2D_Fini();
+            C3D_Fini();
+            gfxExit();
+            return 0;
+          }
+          SDEOF
+          cat > build/app.rsf <<'RSFEOF'
+          BasicInfo:
+            Title                   : "Shadow Duel"
+            CompanyCode             : "00"
+            ProductCode             : "CTR-P-SDUE"
+            ContentType             : Application
+            Logo                    : Homebrew
+
+          TitleInfo:
+            UniqueId                : 0xA7D31
+            Category                : Application
+
+          Option:
+            UseOnSD                 : true
+            FreeProductCode         : true
+            MediaFootPadding        : false
+            EnableCrypt             : false
+            EnableCompress          : true
+
+          AccessControlInfo:
+            FileSystemAccess:
+              - Debug
+              - DirectSdmc
+              - DirectSdmcWrite
+            IdealProcessor          : 0
+            AffinityMask            : 1
+            Priority                : 16
+            MaxCpu                  : 0x9E
+            DisableDebug            : false
+            EnableForceDebug        : false
+            CanWriteSharedPage      : false
+            CanUsePrivilegedPriority: false
+            CanUseNonAlphabetAndNumber: false
+            PermitMainFunctionArgument: false
+            CanShareDeviceMemory    : false
+            RunnableOnSleep         : false
+            SpecialMemoryArrange    : false
+            CoreVersion             : 2
+            DescVersion             : 2
+            ReleaseKernelMajor      : "02"
+            ReleaseKernelMinor      : "33"
+            MemoryType              : Application
+            HandleTableSize         : 512
+            SystemModeExt           : Legacy
+            CpuSpeed                : 268MHz
+            EnableL2Cache           : false
+            CanAccessCore2          : true
+            IORegisterMapping:
+              - 1ff50000-1ff57fff
+              - 1ff70000-1ff77fff
+            MemoryMapping:
+              - 1f000000-1f5fffff:r
+            SystemCallAccess:
+              ArbitrateAddress: 34
+              Break: 60
+              CancelTimer: 28
+              ClearEvent: 25
+              ClearTimer: 29
+              CloseHandle: 35
+              ConnectToPort: 45
+              ControlMemory: 1
+              CreateAddressArbiter: 33
+              CreateEvent: 23
+              CreateMemoryBlock: 30
+              CreateMutex: 19
+              CreateSemaphore: 21
+              CreateThread: 8
+              CreateTimer: 26
+              DuplicateHandle: 39
+              ExitProcess: 3
+              ExitThread: 9
+              GetCurrentProcessorNumber: 17
+              GetHandleInfo: 41
+              GetProcessId: 53
+              GetProcessIdOfThread: 54
+              GetProcessIdealProcessor: 6
+              GetProcessInfo: 43
+              GetResourceLimit: 56
+              GetResourceLimitCurrentValues: 58
+              GetResourceLimitLimitValues: 57
+              GetSystemInfo: 42
+              GetSystemTick: 40
+              GetThreadContext: 59
+              GetThreadId: 55
+              GetThreadIdealProcessor: 15
+              GetThreadInfo: 44
+              GetThreadPriority: 11
+              MapMemoryBlock: 31
+              OutputDebugString: 61
+              QueryMemory: 2
+              ReleaseMutex: 20
+              ReleaseSemaphore: 22
+              SendSyncRequest1: 46
+              SendSyncRequest2: 47
+              SendSyncRequest3: 48
+              SendSyncRequest4: 49
+              SendSyncRequest: 50
+              SetThreadPriority: 12
+              SetTimer: 27
+              SignalEvent: 24
+              SleepThread: 10
+              UnmapMemoryBlock: 32
+              WaitSynchronization1: 36
+              WaitSynchronizationN: 37
+            InterruptNumbers:
+            ServiceAccessControl:
+              - APT:U
+              - $hioFIO
+              - $hostio0
+              - $hostio1
+              - ac:u
+              - boss:U
+              - cam:u
+              - ir:rst
+              - cfg:u
+              - dlp:FKCL
+              - dlp:SRVR
+              - dsp::DSP
+              - ssl:C
+              - fs:USER
+              - gsp::Gpu
+              - hid:USER
+              - http:C
+              - mic:u
+              - ndm:u
+              - news:s
+              - nwm::UDS
+              - ptm:u
+              - pxi:dev
+              - soc:U
+              - gsp::Lcd
+              - y2r:u
+              - ldr:ro
+              - ir:USER
+              - ir:u
+              - csnd:SND
+              - am:u
+              - ns:s
+
+          SystemControlInfo:
+            SaveDataSize: 0KB
+            RemasterVersion: 0
+            StackSize: 0x40000
+            Dependency:
+              ac: 0x0004013000002402L
+              am: 0x0004013000001502L
+              boss: 0x0004013000003402L
+              camera: 0x0004013000001602L
+              cecd: 0x0004013000002602L
+              cfg: 0x0004013000001702L
+              codec: 0x0004013000001802L
+              csnd: 0x0004013000002702L
+              dlp: 0x0004013000002802L
+              dsp: 0x0004013000001a02L
+              friends: 0x0004013000003202L
+              gpio: 0x0004013000001b02L
+              gsp: 0x0004013000001c02L
+              hid: 0x0004013000001d02L
+              http: 0x0004013000002902L
+              i2c: 0x0004013000001e02L
+              ir: 0x0004013000003302L
+              mcu: 0x0004013000001f02L
+              mic: 0x0004013000002002L
+              ndm: 0x0004013000002b02L
+              news: 0x0004013000003502L
+              nim: 0x0004013000002c02L
+              nwm: 0x0004013000002d02L
+              pdn: 0x0004013000002102L
+              ps: 0x0004013000003102L
+              ptm: 0x0004013000002202L
+              ro: 0x0004013000003702L
+              socket: 0x0004013000002e02L
+              spi: 0x0004013000002302L
+              ssl: 0x0004013000002f02L
+          RSFEOF
+          cat <<'B64EOF' | base64 -d > build/icon.png
+          iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAIAAADYYG7QAAADJElEQVR4nM2ZzWsTQRTA3wyzoKAgrTVN2lC/UkP9OOTgQTFU0YDB
+          j4NQkYqgSyht/gAPXjwo6KHgwYoQk1JBoRfBHgpGUKk3QQ9WRK1Wrdo2KWIxIoi0eNh0MpnZ3czMRjaPd0jm470fb968mUlQdFUU
+          GkkIQX4jVAsh2G+EaiEEN1aIGnHJNIme7ujkWva9eueZB1B3U5fGtMddPI0l+197ZUKH1isD5aNlmrUvJmhjKRa3PiTeeGJCh1u2
+          K00Y3xYRaTim5NspABifSIvTk/GhGkBHAwpAYxFHGo4JMgkXO8e6HbEwwUhe3Wncu1gZe5J29OJXYbz3aAAAeg7e4NoJQX4WItE7
+          Jhjk1ZJKogji0mUrdx/2cy6wgUFeza8fXBxLZjQntx/0sy7Ukppg1Dc7bctU9TWVh1Renom1jwa27JKfSWUouBlcSxEvtWKWPnKz
+          DFff054i8mQ0YA5kFENn2w+2bAIhPKVYnG2xPVVchGJoRsi2ALKObeFKzy85A9EIKfJcbtooM4zCSdZuikEMxSW7uPhpcHrGsdtK
+          EWaLSZIZXpbs/NaOq+8/u42gmcuSOa8XMEumVqmpXujsAJlszSTK6ipXTmUqxrXPMrVTwpWJZfD/GXTt9C2Wwedn0PUzWQ5AeZfV
+          V0TvdX6XZc9mzWFTciQw5YeK8mlvqUnCtm5MEh4xczVpRszcf7nCcueDte8IhjupHAD0Zs6JU6wuF6e6Sb3s2NML7aP4GwCM9g3b
+          +KvlDhMEqnpyuY01IR4OGjYrqhOhpSr3opxYartvzCqbBQBQvFMbGI7/DYlWxCCpmqWqmdSON8MVSf4J5VfrBAkThJTUyZBdJqlZ
+          LqtShOK/gvKDD/wOTqyZU7AOAB7f9k4voUqQNKqu99P+2bp5ANi92Cp27fnZavXKi0IOcS5pPNjcqkMmqZ72XPmZbC4YKx92fg+I
+          42M/ApPNBXn7sldYW2cAbj9FMJmkokqVWkxndvpUoBgpbGDHTwWKAEBAwYXsfehja9G2kdg1vkzq/3+CZnr26s0Mz7Z8CS1oO3YS
+          /W0/174ghse7EKPB/uv4B/CW5r7TDJCcAAAAAElFTkSuQmCC
+          B64EOF
+          cat <<'B64EOF' | base64 -d > build/banner.png
+          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
+          KOXH+i1wAAAAAElFTkSuQmCC
+          B64EOF
+          cat <<'B64EOF' | base64 -d > build/audio.wav
+          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
+          dhiBFjYUoxHYDuML1Qi9BasCrf/R/CT6r/d89ZLz9vGr8LLvCu+w7qDu1O5F7+zvv/C28cfy6/MY9Uf2cveS+KP5o/qO+2X8KP3Y
+          /Xn+Dv+a/yIAqwA6AdMBegIxA/oD2ATJBcwG3gf9CCIKRwtmDHcNcQ5MDwAQgxDOENoQoRAfEE8PMg7HDBALEgnTBloEsQHl/gH8
+          Efkm9k7zl/AR7srrz+ks6OvmFOav5b/lRuZD57TokerV7HPvYPKO9e74b/wAAI8DDQdmCowNbxABEzcVBxdqGFsZ1hndGXAZlBhR
+          F64VuBN4Ef0OVQyOCbcG3gMRAV7+z/tw+Ur3ZPXE827yYvGi8Czw/O8N8Frw3PCL8V/yUPNV9Gf1f/aV96T4p/mb+n37TfwK/bT9
+          T/7d/mL/4f9eAN8AZwH6AZoCSwMOBOMEygXABsMHzwjeCeoK7QvfDLkNcQ4BD2EPig92DyAPhQ6iDXcMBQtPCVoHLAXOAkkAqP33
+          +kP4mfUI853wZe5t7MHqaulz6OHnuef+57Lo0elX6z/tgO8Q8uL06fcX+1v+pQHnBA8IEAvZDV4QlBJvFOoV/RalF+AXsBcYFx0W
+          xhQdEyoR+w6cDBkKgAfgBEQCuv9M/Qb78PgS93H1E/T68ifymPFM8T7xavHL8VjyC/Pd88X0vfW99r73vPix+Zn6cvs6/PD8lv0s
+          /rT+Mv+p/xwAkQALAY0BGgK2AmEDHQTpBMYFrwaiB5sIlAmICnALRAz+DJcNBg5GDlAOIA6xDQENDwzaCmYJtAfMBbIDcAEQ/5v8
+          Hfqi9zf16vLF8NbuJ+3D67Lq/Omm6bTpJur96jbszO247/HxbfQh9//5+fwAAAYD/QXVCIEL9Q0kEAUSjxO9FIkV8hX3FZsV4BTO
+          E2oSvxDWDrsMegoeCLQFSQPoAJ3+cfxt+pr4/vac9Xn0lvPz8o7yZvJ08rbyJPO58230OfUX9gD37ffa+MD5nPpr+yv83Px8/Q3+
+          kf4J/3r/5v9QAL0AMQGtATYCzAJyAycE6wS8BZgGewdhCEUJIQrvCqcLRAy+DBANMg0hDdgMVQyUC5YKXAnoBz4GZQRiAj4AA/65
+          +235Kvf89O7yDPFg7/Tt0ez/64PrYeuc6zXsKO107hPw/fEp9I/2IfnU+5r+ZQEqBNgGZQnDC+cNxw9bEZ0ShhMVFEcUHxSeE8gS
+          pRE8EJQOuQy1CpMIXwYkBOwBxf+0/cb7APpq+An33/Xx9D30xPOD83fznfPv82f0//Sx9Xb2Sfci+P341Pmk+mn7IvzL/Gb98/1y
+          /ub+Uf+3/xgAewDjAFEByQFNAt4CfgMsBOcErQV8Bk8HIwjyCLcJawoJC4oL6QsfDCgM/wuhCwsLPgo4CfsHiwbsBCMDOQE0/x79
+          APvl+Nf24vQQ82zx/u/P7ujtTe0E7RDtce0o7jLvivAs8g/0LPZ3+Ob6bv0AAJECFgWAB8YJ2gu1DU4PnRCdEUoSpBKoElkSuxHS
+          EKQPOQ6aDNAK5gjlBtgEygLFANP++vxE+7j5Wfgt9zb2dfXq9JX0cvR/9Lb0FPWS9Sv22faW91v4Jfnt+bH6bPsc/L/8Vf3d/Vj+
+          yP4v/47/6v9EAKEAAwFtAeABYALtAocDLQTfBJkFWwYeB+AHmwhJCeYJawrTChgLNQsnC+kKeQrVCf4I8we3Bk4FuwMGAjQAT/5e
+          /Gv6f/il9ub0TfPh8azwte8D75nufe6v7jDv/+8Z8XnyGfTy9fv3Kvp1/ND+MAGJA9AF+wf9Cc8LZw2+Ds8PlRAOETkRFxGpEPQP
+          /Q7JDWIMzwoYCUkHaQWEA6IBzv8N/mn86PqP+WL4Zveb9gP2nPVl9Vv1e/XA9Sb2p/Y/9+b3mfhR+Qv6wvpz+xr8t/xH/cv9Qv6u
+          /hH/bP/C/xQAaQDAAB4BhAH0AXAC9wKLAyoE0gSCBTUG6QaZB0AI2QhfCc0JHgpMClMKMArgCWEJswjUB8cGjwUuBKoCCQFT/439
+          wfv3+Tn4j/YD9Z7zZ/Jm8aLwHvDg7+rvPfDY8Lrx3vJB9Nz1p/ea+av70f0AAC4CUgRfBk0IEQqlCwANHA72DokP1Q/YD5YPDw9J
+          DkkNFQy0Ci8JjgfbBR0EXgKnAAD/b/37+6r6gPmB+K/3DPeW9k32MPY79mr2ufYl96b3Ovja+IL5LfrY+n77Hfyy/D39vP0w/pj+
+          9/5O/5//7f85AIgA3AA2AZgBBQJ8Av4CjAMjBMEEZQUMBrAGTwfjB2gI2QgxCWwJhQl5CUQJ5QhaCKMHwAa0BYEEKwO4ASwAkf7q
+          /EL7ofkO+JL2NvUC9PvyKvKS8TjxIPFL8bjxaPJY84P05PV29zD5C/v+/P7+AgEBA/AExwZ8CAcKYguFDG0NFQ58DqEOhA4mDo0N
+          uwy2C4QKLgm5BzAGmAT8AmMB1f9Y/vP8rPuH+oj5svgG+IT3LPf+9vX2EfdL96L3EPiQ+B/5tvlT+vH6jPsi/LH8Nv2w/SD+hf7h
+          /jX/gv/L/xEAWQCjAPMASgGpARIChQICA4kDGAStBEYF3gV0BgIHhAf2B1MIlwi+CMUIpwhjCPgHYwemBsIFuASNA0QC4QBt/+z9
+          Zfzg+mX5+/er9nz1dPSa8/Lyg/JO8lfynfIh8+Dz2fQG9mP36fiR+lL8Jf4AANoBqwNpBQ0HjQjkCQoL/Au1DDINcg11DT0Nygwi
+          DEgLQwoXCc0Hawb5BH4DAwKOACf/0v2W/Hj7e/qi+fD4ZfgB+MP3qve099z3H/h6+On4Zvnu+X36Dvuf+yz8s/wy/af9E/52/s7+
+          H/9p/67/8P8xAHQAugAHAVoBtwEcAosCAwODAwoElQQiBa4FNQazBiQHhAfPBwEIFggLCN8HjgcYB3wGvAXYBNMDsQJ1ASYAyP5h
+          /fn7lvpA+f731/bQ9fH0P/S+83LzXvOC89/zdfRA9T72ave/+Df6yvty/SX/2wCNAjIEwQU1B4QIqwmiCmcL9gtODG0MVAwFDIIL
+          0AryCe8IzAePBkEF5wOJAi0B3P+Y/mn9U/xa+4L6zPk5+cv4gfhZ+FL4afib+OX4Qvmv+Sj6qfou+7T7OPy4/DD9of0J/mj+vv4M
+          /1T/lf/T/w8ASwCLAM4AGAFpAcIBJAKOAgEDegP5A3oE/AR7BfMFYgbDBhIHTAdtB3MHWQcgB8QGRgamBeQEAgQEA+wBvwCD/zz+
+          8Pym+2T6MfkT+BH3MfZ49er0i/Re9GX0ofQR9bT1h/aH96/4+vli++D8bf4AAJMBHQOYBP0FQwdmCGAJLgrLCjULawtuCz4L3QpO
+          CpUJtwi5B6AGcwU5BPgCtQF4AEj/Jv4a/Sf8UPuY+gH6ivk2+QH57Pj0+Bb5T/mc+fr5ZfrY+lH7zftI/L/8Mv2e/QL+Xv6x/v3+
+          Qf+A/7r/8/8pAGIAngDfACYBdAHLASkCjwL8Am4D5ANcBNMERQWwBRAGYgahBswG3gbVBq8GawYGBoIF3wQdBEADSQI9ASAA9/7H
+          /ZX8Z/tF+jP5OPhZ95z2BfaX9Vf1RfVk9bP1Mvbf9rb3tfjX+Rb7bfzU/Ub/ugAqApAD4wQfBjwHNggICa8JKQpzCo0KeAo1CsYJ
+          LwlyCJYHnwaSBXYEUQMnAgAB4f/O/s394fwO/Fb7u/o/+uH5ovmA+Xr5jvm4+ff5Rvqj+gr7d/vo+1r8yvw2/Z39/f1V/qb+7/4x
+          /27/pf/a/wwAQAB2AK8A7gAyAX4B0QEsAo0C9AJfA80DPASnBA4FbAW+BQEGMwZPBlMGPgYNBr8FVAXMBCcEaAOPAqIBogCW/4D+
+          Zv1N/Dz7N/pF+Wr4rPcO95b2RfYf9iX2WPa39kH39PfO+Mr54/oU/Fn9qv4AAFYBpQLnAxYFKwYiB/cHpQgqCYUJswm1CYwJOgnB
+          CCQIZwePBqAFoQSWA4UCcwFmAGP/bv6K/bv8Bfxp++j6hPo8+g/6/fkE+iD6UfqT+uL6Pfuf+wb8b/zX/D39nv36/U/+nf7k/iT/
+          Xv+T/8X/9f8jAFMAhgC9APoAPAGFAdUBLAKJAuoCTgO0AxkEegTVBCYFbAWiBcYF1QXOBa0FcwUeBa4EIwR+A8IC8QENARsAH/8c
+          /hn9Gfwi+zn6ZPmn+Ab4hvcp9/L24/b99kD3rPc/+Pb4z/nF+tT79/wo/mL/ngDXAQYDJwQzBSUG+QasBzoIoQjgCPYI5AirCE0I
+          zActB3EGoAW7BMoD0QLUAdkA5v/9/iL+Wf2m/Ar8hvsd+836mPp7+nb6h/qr+uD6I/ty+8n7JvyG/Of8Rv2i/fn9Sv6W/tr+GP9Q
+          /4T/s//g/woANgBkAJUAygAEAUQBiwHYASoCggLdAjsDmAP0A0sEmwThBBoFQwVbBV8FTQUkBeEEhwQTBIcD5AItAmMBigCm/7r+
+          yv3c/PT7FvtJ+o/57fhn+AH4vPec96H3zPcd+JL4K/nj+bn6qPus/L/93f4AACIBPwJRA1EEPQUPBsMGWAfJBxUIPQg/CBwI1gdv
+          B+oGSQaSBccE7gMMAyQCOwFXAHv/qv7p/Tn9nvwa/Kz7V/sa+/T65frq+gP7LPtk+6j79ftI/J/8+PxR/aj9+v1I/pD+0v4P/0X/
+          dv+k/87/9v8eAEcAcgChANQADQFLAY8B2AEnAnkCzwIlA3sDzQMaBGAEmwTIBOcE9ATuBNIEoQRYBPkDgwP4AlgCpgHlABcAQf9l
+          /on9r/ze+xj7Y/rC+Tr5zfh++E/4Q/hZ+JL47fhq+Qb6vvqP+3X8bP1v/nr/hgCQAZIChwNqBDgF7AWEBvwGVAeKB50HjQddBw0H
+          oAYYBnkFxwQFBDgDZAKNAbgA6v8k/2r+wP0n/aP8M/zZ+5b7aPtQ+0z7Wvt4+6b73/si/Gz8u/wM/V79r/39/Uf+jP7M/gb/O/9r
+          /5f/v//l/wkALgBVAH4AqwDdABMBTwGRAdcBIQJvAr4CDgNbA6UD6QMkBFUEeASNBJAEgQRdBCUE2AN2A/8CdQLZAS0BdQC0/+v+
+          IP5V/ZD81Psl+4f6/vmM+TX5+/jg+OT4CflN+bH5MvrP+oX7UPws/Rb+Cf8AAPYA6AHRAqsDcwQlBb8FPAacBt4G/wYBB+MGqAZQ
+          Bt8FVwW7BA8EVwOWAtEBDAFKAI//3v45/qT9If2w/FP8C/zX+7f7qvuv+8P75/sW/E/8kfzX/CL9bf25/QL+SP6K/sj+AP8z/2H/
+          i/+y/9b/+P8ZADwAYQCJALQA5AAZAVMBkQHUARoCYgKsAvQCOwN8A7cD6QMQBCoENQQwBBgE7gOxA2AD/AKFAv0BZgHCABMAXv+j
+          /uj9L/19/NX7PPuz+j/64vmf+Xj5bfmA+bD5/vlo+uz6iPs6/P78z/2s/o7/cgBTAS4C/wLAA24ECAWJBe8FOQZnBncGagZBBv0F
+          oAUtBaYEDgRqA7wCCAJSAZ0A7f9F/6f+F/6V/ST9xvx5/ED8GvwF/AH8Dfwn/E78fvy3/Pb8Of1+/cT9Cf5L/or+xf77/iz/Wf+C
+          /6b/yf/p/wcAJwBIAGsAkQC7AOoAHQFUAZABzwERAlQCmALaAhkDUgOFA64DzAPdA+AD0wO1A4UDRAPwAosCFgKRAQABYwC//xX/
+          aP68/RX9dfzg+1r75vqF+jv6Cvrz+fb5FfpQ+qT6EvuX+zL83vyZ/WD+Lv8AANEAnwFkAh0DxwNfBOEETAWdBdUF8QXzBdoFpwVd
+          BfwEiQQEBHID1gIyAosB4wA+AKD/Cv9+/v/9kP0w/eH8pPx4/Fz8UfxV/Gf8hfyt/N78Ff1R/ZD90f0R/k/+i/7D/vf+J/9S/3n/
+          nf++/9z/+f8VADMAUgB0AJkAwgDuAB8BVAGNAckBBgJFAoICvgL2AigDUgNzA4kDkwOOA3oDVwMiA94CiQIkArEBMAGlABAAdv/Y
+          /jn+nP0F/Xb89PuA+x37zvqV+nT6a/p7+qT65vpA+7D7NfzM/HL9JP7f/p//YAAgAdoBiwIvA8MDRgSzBAoFSQVwBX4FcwVQBRYF
+          xwRlBPIDcgPmAlICuQEfAYUA8P9h/9v+YP7y/ZP9Qv0C/dH8sPye/Jv8pvy8/Nz8Bf02/Wv9pP3f/Rr+VP6N/sL+9P4i/0z/cv+V
+          /7T/0f/s/wYAIQA9AFsAewCfAMcA8gAhAVMBiQHBAfoBNAJsAqEC0gL9AiADOQNIA0oDPwMmA/0CxgJ/AikCxQFVAdkAVADJ/zj/
+          pv4U/oX9/vx//A78qvtZ+xr78Prc+t/6+vor+3P70PtC/MX8V/32/Z/+Tv8AALIAYAEIAqUCNQO2AyUEfwTFBPQEDAUNBfgEzQSO
+          BDwE2gNpA+0CaALeAU8BwQA1AK//L/+4/k3+7v2d/Vr9Jf0A/en83/zj/PL8C/0t/Vf9hv25/e79Jf5b/pD+w/7z/h//R/9s/47/
+          rP/I/+L/+v8SACsARgBiAIIApADKAPQAIQFRAYQBuAHtASICVAKDAq4C0gLuAgEDCQMFA/QC1gKpAm8CJwLRAW8BAgGMAA4Ai/8F
+          /33++P14/f/8kPwt/Nr7l/tm+0r7QvtQ+3P7q/v3+1b8x/xH/dT9bP4L/67/UgD1AJMBKQK0AjIDoQP+A0gEfQSeBKoEoASDBFIE
+          DwS8A1oD7QJ2AvkBdwHzAHEA8/95/wf/n/5C/vD9rP11/Uz9MP0h/R79J/06/VX9eP2h/c/9//0x/mP+lf7F/vL+Hf9E/2f/iP+l
+          /8D/2P/v/wUAHAA0AE0AaQCHAKkAzQD1ACABTgF9Aa4B3wEOAjwCZQKKAqcCvQLJAssCwgKsAooCWwIeAtYBgQEhAbgASADS/1f/
+          2v5e/uX9cv0H/ab8UvwM/Nf7s/ui+6X7u/vm+yP8cvzS/EH9vv1F/tT+af8AAJcAKwG5AT8CugInA4UD0gMNBDUESQRKBDgEFATe
+          A5kDRQPmAnwCDAKWAR0BpAAtALv/Tv/q/o7+Pv75/cD9lP10/WD9WP1b/Wj9ff2a/b395f0R/j7+bf6b/sj+8/4b/0H/Y/+D/5//
+          uf/Q/+b/+/8PACUAOwBTAG4AjACsAM8A9QAeAUkBdgGjAc8B+gEiAkYCZQJ9Ao0ClAKQAoICaAJDAhEC1AGLATgB2wB3AAwAnf8r
+          /7j+R/7Z/XP9FP3B/Hr8QfwY/AD8+fsF/CL8UvyT/OT8RP2w/Sj+qf4w/7v/RQDQAFYB1QFMArcCFQNkA6MD0APsA/YD7gPVA6sD
+          cgMsA9kCfAIXAq0BPgHPAGAA9f+O/y3/1P6F/kD+Bv7X/bT9nP2Q/Y39lf2l/bz92v39/SP+TP53/qL+zP70/hv/P/9g/37/mv+z
+          /8n/3v/y/wQAGAAsAEEAWQBzAI8ArgDQAPUAGwFEAW0BlwG/AeUBCQIoAkECUwJeAmACWAJFAigCAALNAY8BRwH2AJ0APQDZ/3D/
+          Bv+d/jb+1P15/Sf94Pyl/Hf8WfxL/E38YPyE/Lj8+/xN/av9Ff6I/gH/gP8AAIAA/gB3AegBUAKtAv0CPwNxA5IDpAOlA5UDdgNJ
+          Aw4DxwJ2AhwCvQFYAfIAiwAmAMb/af8U/8b+gv5H/hf+8f3W/cX9v/3B/cz93v33/RX+N/5b/oL+qf7R/vf+G/8+/17/e/+W/67/
+          w//X/+r//P8NAB8AMgBHAF0AdgCSALAA0ADzABgBPQFkAYkBrgHQAe8BCQIdAioCMAItAiECCwLrAcEBjQFPAQkBugBlAAoArP9L
+          /+n+if4s/tX9hf0+/QL90vyv/Jr8lPye/Lf84PwX/Vz9rf0K/m/+3f5P/8X/OwCwACIBjwHzAU4CngLhAhYDPQNVA10DVgNBAx4D
+          7QKxAmsCHALGAWwBDgGvAFEA9/+f/03/Av++/oP+Uv4r/g3++f3u/ez98v0A/hT+Lf5K/mv+jv6y/tb++v4d/z3/XP94/5L/qf++
+          /9L/4//0/wQAFAAlADcASwBhAHkAlACxANAA8QATATYBWQF8AZwBugHUAeoB+gEDAgQC/QHuAdUBswGHAVMBFgHRAIUAMwDf/4b/
+          LP/T/nv+KP7b/ZX9WP0m/QD95vza/Nz87PwK/Tb9cP21/QX+X/7A/ij/k/8AAG0A2AA+AZ8B9wFGAooCwQLsAgkDFwMYAwsD8QLK
+          ApgCXAIXAssBegEkAc0AdgAgAM7/gP83//b+u/6K/mH+Qf4q/hv+Fv4Y/iH+MP5F/l/+fP6b/rz+3f7+/h//Pv9b/3b/j/+m/7r/
+          zf/e/+7//f8LABoAKwA8AE8AZQB8AJUAsQDOAO0ADgEuAU4BbQGKAaQBugHLAdcB3AHZAc8BvAGhAX4BUQEdAeEAngBWAAgAuf9m
+          /xP/wv5z/in+5f2p/XX9TP0v/R39GP0h/Tb9Wf2H/cL9B/5V/qz+Cf9q/87/MgCWAPcAUwGoAfUBOQJyAp8CwALUAtsC1gLDAqUC
+          fAJJAg4CywGCATUB5QCVAEUA+P+u/2j/KP/v/r3+k/5x/lj+R/4+/jz+Qf5N/l7+c/6M/qj+xv7l/gP/Iv8//1v/df+N/6P/tv/I
+          /9n/6P/2/wMAEQAgAC8AQABTAGcAfgCWALAAzADpAAcBJQFCAV4BeAGOAaABrQG1AbYBsAGjAY4BcQFMASAB7ACxAHEALADk/5j/
+          TP8A/7b+b/4u/vL9v/2U/XT9Xv1T/VX9Y/19/aL90/0N/lL+nv7x/kj/pP8AAFwAtwAOAWABqwHuASgCVwJ7ApQCoAKhApYCfwJe
+          AjQCAQLGAYYBQQH4AK4AZAAbANb/k/9W/x7/7P7C/p/+hP5w/mT+YP5h/mn+dv6I/p7+tv7R/u3+Cf8l/0H/W/90/4v/oP+z/8X/
+          1P/j//D//f8JABYAJAAzAEMAVQBpAH8AlgCvAMoA5QAAARwBNgFPAWUBdwGGAZABlAGSAYkBeQFiAUQBHgHyAL8AhgBJAAcAw/99
+          /zf/8v6v/nD+Nv4D/tf9tf2b/Y39if2Q/aL9v/3n/Rj+U/6W/t/+Lv+B/9b/KgB/ANEAHwFoAaoB4wETAjoCVgJnAm0CaAJZAj8C
+          HALxAb4BhgFIAQYBwwB+ADoA+f+6/3//Sf8Y/+7+yv6t/pj+if6C/oD+hf6P/p3+r/7F/tz+9f4P/yr/Q/9c/3T/iv+e/7H/wv/R
+          /9//7P/4/wIADgAbACgANgBGAFcAawB/AJYArgDGAOAA+QASASkBPwFSAWEBbQFzAXQBbwFkAVIBOQEaAfQAyACWAGAAJQDo/6j/
+          Z/8n/+j+rP50/kL+Fv7y/db9w/27/bz9yP3e/f39J/5Z/pP+0/4a/2T/sv8AAE4AmwDlACsBawGkAdUB/QEbAjACOwI7AjICHwID
+          At8BswGCAUsBEAHTAJQAVQAXANz/pP9v/0D/Fv/y/tT+vf6t/qP+nv6g/qf+sv7B/tP+6P7//hb/Lv9G/17/dP+J/53/r/+//87/
+          2//n//P//v8IABMAHwArADkASABZAGwAgACVAKsAwgDaAPEABwEcAS8BPwFLAVQBVwFVAU4BQQEtARMB8wDNAKIAcgA+AAYAzf+R
+          /1X/Gv/i/qz+e/5Q/iv+Df74/ev96P3u/f39Fv44/mL+lP7M/gv/Tv+U/9z/JABsALIA9AAyAWkBmgHDAeQB/AEKAg8CCwL+AegB
+          ywGmAXsBSwEWAd8ApQBrADIA+v/F/5L/ZP87/xf/+f7h/s7+wv67/rr+vv7G/tP+4v70/gj/Hv80/0r/YP91/4n/nP+t/73/y//Y
+          /+T/7//5/wIADAAXACIALgA7AEoAWgBsAH8AkwCoAL4A0wDoAPwADwEfASwBNgE7ATwBOAEuAR8BCgHvAM8AqgCAAFEAHwDs/7X/
+          fv9H/xL/3/6w/oX+YP5B/in+Gv4S/hP+Hf4w/kv+bv6Y/sr+Af88/3z/vv8AAEIAhADDAP4ANAFkAY4BsAHKAdwB5QHlAd0BzQG1
+          AZcBcgFIARkB5wCzAH4ASAAUAOL/sv+F/13/Of8b/wL/7v7g/tf+1P7V/tv+5P7x/gH/Ev8l/zn/Tv9i/3b/if+b/6z/u//J/9X/
+          4f/r//X//v8GABAAGgAlADAAPQBMAFsAbAB+AJEApQC5AM0A4ADxAAEBDwEZASABIwEiARwBEAEAAeoAzgCuAIoAYQA0AAUA1P+i
+          /2//Pf8N/9/+tv6R/nH+WP5G/jv+Of4+/kv+YP59/qD+y/77/jD/af+k/+L/HgBcAJcAzwAEATMBXAF/AZsBrwG8AcABvAGxAZ8B
+          hgFmAUIBGQHsAL0AjABbACoA+//O/6P/fP9Z/zr/If8M//z+8v7s/uv+7/72/gD/Df8d/y7/QP9T/2X/eP+K/5v/q/+6/8f/0//e
+          /+j/8f/6/wIACgATAB0AJwAyAD8ATQBcAGwAfQCPAKEAswDFANYA5gD0AP8ABwEMAQwBCQEBAfQA4gDLALAAkABsAEUAGwDv/8H/
+          kv9j/zb/C//i/r7+n/6E/nD+Y/5d/l7+Zv52/o3+q/7P/vj+J/9a/5D/yP8AADgAcAClANgABgEvAVIBbwGFAZQBnAGcAZUBiAFz
+          AVkBOgEWAe8AxACYAGsAPQARAOb/vv+Y/3b/V/89/yj/F/8L/wT/Af8C/wf/D/8a/yf/Nv9G/1f/af96/4v/m/+q/7n/xf/R/9z/
+          5v/u//f///8FAA0AFgAfACkANABAAE0AXABrAHsAjACdAK4AvgDNANoA5gDvAPUA9wD2APEA5wDZAMYArwCUAHUAUgAsAAQA2/+w
+          /4X/W/8y/wv/6P7I/q7+mP6J/oD+ff6C/o3+n/63/tX++f4i/0//f/+y/+b/GgBOAIAAsADcAAUBKAFFAV0BbgF5AXwBeQFwAWAB
+          SwEwAREB7gDJAKEAdwBNACQA/P/V/7H/kP9y/1j/Qv8x/yT/G/8W/xX/GP8e/yf/Mv8//03/Xf9t/33/jf+c/6r/uP/E/9D/2v/j
+          /+z/9P/7/wEACQAQABgAIQArADUAQQBOAFwAagB5AIkAmACoALYAwwDPANgA3wDjAOQA4QDaAM8AwACtAJUAegBcADoAFgDy/8r/
+          o/97/1T/MP8O/+/+1P6+/q3+of6c/p3+pP6x/sX+3v79/iD/SP9z/6H/0P8AADAAXwCMALcA3gABAR8BNwFKAVcBXgFeAVgBTAE7
+          ASUBCwHsAMsApwCBAFoANAAOAOr/yP+o/4r/cf9b/0n/Ov8w/yr/KP8o/y3/M/89/0j/Vf9i/3H/gP+O/53/qv+3/8P/zv/Y/+H/
+          6v/x//j///8EAAsAEwAaACMALAA2AEIATgBbAGkAdwCFAJMAoQCuALkAwwDLANAA0gDRAMwAxAC4AKgAlQB+AGMARgAmAAMA4f+8
+          /5j/dP9R/zD/Ev/3/uH+z/7B/rr+uP67/sX+1P7p/gL/If9E/2r/k/++/+r/FgBCAG0AlQC7AN0A+wAUASgBNwFAAUMBQAE4ASsB
+          GQECAegAygCqAIgAZQBCAB4A/f/c/73/of+H/3H/X/9Q/0X/Pf85/zn/O/9A/0f/Uf9c/2j/df+D/5H/nv+r/7f/w//N/9f/4P/o
+          /+//9v/8/wEABwAOABUAHAAkAC0ANwBCAE4AWgBnAHQAgQCOAJoApgCwALgAvQDBAMEAvwC5ALAAowCTAH8AaABOADIAEwD0/9L/
+          sf+P/27/T/8y/xj/Af/u/uD+1v7S/tL+2P7k/vT+Cv8k/0L/ZP+I/6//1/8AACgAUQB3AJsAvQDaAPQACAEYASMBKQEpASQBGgEM
+          AfkA4gDJAKwAjQBtAE0ALAAMAO7/0P+1/5z/hv90/2T/WP9Q/0r/SP9J/0z/Uv9a/2T/bv96/4f/k/+g/6z/t//C/83/1v/e/+b/
+          7f/z//n///8EAAoAEAAWAB0AJQAuADgAQgBNAFkAZQBxAH0AiQCUAJ0ApgCsALAAsgCxAK4ApwCcAI8AfgBrAFQAOwAgAAMA5v/H
+          /6f/if9r/0//Nv8f/wz//f7x/uv+6f7s/vT+Af8T/yn/Q/9g/4H/o//I/+7/EgA4AFwAfwCfALwA1QDrAPwACAEQARIBEAEJAf4A
+          7wDbAMUArACRAHQAVgA4ABoA/f/h/8f/r/+a/4f/d/9r/2H/W/9X/1f/Wf9d/2P/a/91/3//iv+W/6H/rf+4/8L/zP/V/93/5f/r
+          //L/9//9/wEABgAMABEAGAAfACYALwA4AEIATABXAGMAbgB5AIMAjQCVAJwAoQCkAKQAogCdAJUAigB8AGwAWABCACoAEAD2/9n/
+          vf+g/4T/av9R/zv/KP8Y/wv/A////gD/Bf8P/x3/L/9F/1//e/+a/7v/3v8AACIARABlAIQAoAC5AM8A4QDuAPcA/AD8APgA8ADj
+          ANMAwACqAJIAeABdAEEAJQAKAPH/2P/A/6v/mf+J/3z/cv9q/2b/ZP9l/2j/bf9z/3v/hP+O/5n/pP+u/7n/wv/M/9T/3P/k/+r/
+          8P/1//r///8DAAgADQATABkAIAAnAC8AOABBAEsAVgBgAGoAdAB9AIYAjQCSAJYAlwCXAJMAjQCFAHkAawBaAEcAMgAbAAIA6v/P
+          /7X/m/+C/2r/VP9B/zH/JP8a/xX/E/8W/x3/KP83/0n/X/94/5T/sf/Q/w==
+          B64EOF
+
+      - name: Compile (3dsx)
+        run: |
+          export DEVKITPRO=${DEVKITPRO:-/opt/devkitpro}
+          export DEVKITARM=${DEVKITARM:-$DEVKITPRO/devkitARM}
+          export PATH=$PATH:$DEVKITPRO/tools/bin:$DEVKITARM/bin:/usr/local/bin
+          ARCH="-march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft"
+          arm-none-eabi-gcc -g -Wall -O2 -mword-relocations -ffunction-sections $ARCH -D__3DS__ \
+            -I$DEVKITPRO/libctru/include source/main.c \
+            -specs=3dsx.specs $ARCH -L$DEVKITPRO/libctru/lib \
+            -lcitro2d -lcitro3d -lctru -lm -o build/shadowduel.elf
+          bannertool makesmdh -s "Shadow Duel" -l "Original shadow fighting game" -p "CART3R.JAILBREAK" -i build/icon.png -o build/icon.smdh
+          3dsxtool build/shadowduel.elf build/shadowduel.3dsx --smdh=build/icon.smdh
+          ls -l build
+
+      - name: Make CIA
+        continue-on-error: true
+        run: |
+          export PATH=$PATH:/usr/local/bin
+          bannertool makebanner -i build/banner.png -a build/audio.wav -o build/banner.bnr
+          makerom -f cia -o build/shadowduel.cia -target t -exefslogo -elf build/shadowduel.elf -rsf build/app.rsf -banner build/banner.bnr -icon build/icon.smdh
+          ls -l build
+
+      - name: Upload build
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ShadowDuel-3DS
+          path: |
+            build/shadowduel.cia
+            build/shadowduel.3dsx
+          if-no-files-found: warn
